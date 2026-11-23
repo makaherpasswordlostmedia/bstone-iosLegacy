@@ -61,12 +61,27 @@ jobs:
       - name: Check libc++ headers
         run: |
           SDK="$THEOS/sdks/iPhoneOS9.3.sdk"
+          CXXDIR="$THEOS/toolchain/linux/iphone/include/c++/v1"
           if [ -f "$SDK/usr/include/c++/v1/vector" ]; then
             echo "SDK libc++ headers found (used by the Makefile)"
           else
-            echo "SDK has no libc++ headers: falling back to the toolchain's, which needs __config_site"
-            touch "$THEOS/toolchain/linux/iphone/include/c++/v1/__config_site"
+            echo "SDK has no libc++ headers: using the toolchain's libc++ ($CXXDIR)"
+            ls "$CXXDIR" | head -5
           fi
+          # The toolchain tarball ships libc++ headers without the configure-time __config_site.
+          if [ ! -f "$CXXDIR/__config_site" ]; then
+            cat > "$CXXDIR/__config_site" <<'CFG'
+          #ifndef _LIBCPP_CONFIG_SITE
+          #define _LIBCPP_CONFIG_SITE
+          #define _LIBCPP_ABI_VERSION 1
+          #define _LIBCPP_ABI_NAMESPACE __1
+          #define _LIBCPP_HARDENING_MODE_DEFAULT _LIBCPP_HARDENING_MODE_NONE
+          #define _LIBCPP_PSTL_CPU_BACKEND_SERIAL 1
+          #define _LIBCPP_DISABLE_AVAILABILITY 1
+          #endif
+          CFG
+          fi
+          cat "$CXXDIR/__config_site"
 
       - name: Locate BStone sources (or clone upstream)
         run: |
@@ -96,6 +111,9 @@ jobs:
           ARCHS = armv7
 
           export ADDITIONAL_OBJCFLAGS += -Wno-error=deprecated-module-dot-map -Wno-deprecated-module-dot-map
+
+          # Clang modules break here (the SDK / toolchain module maps are for other clang versions): plain textual includes.
+          export USE_MODULES = 0
 
           include $(THEOS)/makefiles/common.mk
           include sources.mk
@@ -129,7 +147,7 @@ jobs:
           	-Wno-error=non-modular-include-in-framework-module -Wno-non-modular-include-in-framework-module \
           	-Wno-error=non-modular-include-in-module -Wno-non-modular-include-in-module
 
-          BStoneiOS7_CFLAGS = -O2 -fno-modules -DNDEBUG -DBSTONE_IOS=1 -DVK_NO_PROTOTYPES -fno-strict-aliasing \
+          BStoneiOS7_CFLAGS = -O2 -fno-modules -fno-cxx-modules -DNDEBUG -DBSTONE_IOS=1 -DVK_NO_PROTOTYPES -fno-strict-aliasing \
           	$(BS_INCLUDES) $(BS_WARN)
           # C++14 only: libc++ of the 9.3 SDK, nothing newer than iOS 7 runtime features (no thread_local, no clock_gettime).
           # The toolchain ships a modern libc++ (clang 19, needs __config_site + C++ modules) whose ABI is newer than the
