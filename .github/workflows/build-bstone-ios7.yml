@@ -151,7 +151,7 @@ jobs:
           ifneq ($(wildcard $(BS_SDK)/usr/include/c++/v1/vector),)
           BS_LIBCXX = -nostdinc++ -isystem $(BS_SDK)/usr/include/c++/v1
           endif
-          BStoneiOS7_CXXFLAGS = -std=gnu++14 -stdlib=libc++ $(BS_LIBCXX)
+          BStoneiOS7_CXXFLAGS = -std=gnu++14 -stdlib=libc++ -D_LIBCPP_DISABLE_EXTERN_TEMPLATE $(BS_LIBCXX)
           BStoneiOS7_OBJCFLAGS = -fobjc-arc
           BStoneiOS7_LDFLAGS = -stdlib=libc++
           BStoneiOS7_FRAMEWORKS = UIKit Foundation CoreGraphics QuartzCore OpenGLES AudioToolbox AVFoundation
