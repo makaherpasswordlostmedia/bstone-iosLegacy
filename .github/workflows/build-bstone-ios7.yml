@@ -45,18 +45,12 @@ jobs:
           tar -xjf /tmp/iphoneos9.3.sdk.tbz2 -C "$THEOS/sdks"
           ls "$THEOS/sdks"
 
-      - name: Fix legacy module maps in SDK (clang 19)
+      - name: Remove clang module maps (SDK + toolchain)
         run: |
-          SDK="$THEOS/sdks/iPhoneOS9.3.sdk"
-          for fw in "$SDK"/System/Library/Frameworks/*.framework; do
-            if [ -f "$fw/module.map" ]; then
-              mkdir -p "$fw/Modules"
-              mv "$fw/module.map" "$fw/Modules/module.modulemap"
-            fi
-          done
-          find "$SDK/usr/include" -name module.map | while read -r m; do
-            mv "$m" "$(dirname "$m")/module.modulemap"
-          done
+          # Theos builds with -fmodules; the module maps of the old SDK and of the toolchain's libc++ do not
+          # match this clang and produce "could not build module" / cyclic Darwin errors. Without module maps
+          # clang falls back to plain textual #include.
+          find "$THEOS/sdks" "$THEOS/toolchain" \( -name 'module.map' -o -name 'module.modulemap' \) -print -delete | wc -l
 
       - name: Check libc++ headers
         run: |
