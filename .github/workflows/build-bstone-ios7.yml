@@ -58,6 +58,16 @@ jobs:
             mv "$m" "$(dirname "$m")/module.modulemap"
           done
 
+      - name: Check libc++ headers
+        run: |
+          SDK="$THEOS/sdks/iPhoneOS9.3.sdk"
+          if [ -f "$SDK/usr/include/c++/v1/vector" ]; then
+            echo "SDK libc++ headers found (used by the Makefile)"
+          else
+            echo "SDK has no libc++ headers: falling back to the toolchain's, which needs __config_site"
+            touch "$THEOS/toolchain/linux/iphone/include/c++/v1/__config_site"
+          fi
+
       - name: Locate BStone sources (or clone upstream)
         run: |
           ROOT=$(find . -maxdepth 3 -path ./theos -prune -o -path '*/src/bstone/CMakeLists.txt' -print | head -n1)
@@ -119,10 +129,16 @@ jobs:
           	-Wno-error=non-modular-include-in-framework-module -Wno-non-modular-include-in-framework-module \
           	-Wno-error=non-modular-include-in-module -Wno-non-modular-include-in-module
 
-          BStoneiOS7_CFLAGS = -O2 -DNDEBUG -DBSTONE_IOS=1 -DVK_NO_PROTOTYPES -fno-strict-aliasing \
+          BStoneiOS7_CFLAGS = -O2 -fno-modules -DNDEBUG -DBSTONE_IOS=1 -DVK_NO_PROTOTYPES -fno-strict-aliasing \
           	$(BS_INCLUDES) $(BS_WARN)
           # C++14 only: libc++ of the 9.3 SDK, nothing newer than iOS 7 runtime features (no thread_local, no clock_gettime).
-          BStoneiOS7_CXXFLAGS = -std=gnu++14 -stdlib=libc++
+          # The toolchain ships a modern libc++ (clang 19, needs __config_site + C++ modules) whose ABI is newer than the
+          # libc++.dylib of iOS 7. Use the libc++ headers of the 9.3 SDK instead and turn clang modules off.
+          BS_SDK = $(THEOS)/sdks/iPhoneOS9.3.sdk
+          ifneq ($(wildcard $(BS_SDK)/usr/include/c++/v1/vector),)
+          BS_LIBCXX = -nostdinc++ -isystem $(BS_SDK)/usr/include/c++/v1
+          endif
+          BStoneiOS7_CXXFLAGS = -std=gnu++14 -stdlib=libc++ $(BS_LIBCXX)
           BStoneiOS7_OBJCFLAGS = -fobjc-arc
           BStoneiOS7_LDFLAGS = -stdlib=libc++
           BStoneiOS7_FRAMEWORKS = UIKit Foundation CoreGraphics QuartzCore OpenGLES AudioToolbox AVFoundation
