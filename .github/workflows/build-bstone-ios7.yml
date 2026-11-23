@@ -1,0 +1,2789 @@
+name: BStone iOS 7 (armv7) .ipa + .deb
+
+# One self-contained workflow: drop THIS file into .github/workflows/ of a repository that contains the
+# BStone sources (the bstone-master tree). Everything else -- the whole iOS port (ios/ folder), the patches
+# to the BStone core, Theos, the toolchain and the SDK -- is created by the steps below.
+# If the repository has no BStone sources, upstream master is cloned.
+#
+# Result: artifact with BStone-iOS7-armv7.ipa / .deb (unsigned; jailbreak install or re-sign yourself).
+
+on:
+  push:
+  workflow_dispatch: {}
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    env:
+      THEOS: ${{ github.workspace }}/theos
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install host build tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y wget gnupg build-essential perl curl ca-certificates \
+                                  zip unzip xz-utils bzip2 git fakeroot make patch python3
+
+      - name: Install Theos + iOS cross toolchain
+        run: |
+          git clone --recursive https://github.com/theos/theos.git "$THEOS"
+          mkdir -p "$THEOS/toolchain/linux/iphone"
+          curl -fsSL \
+            "https://github.com/L1ghtmann/llvm-project/releases/download/main-update_3-eabca92/iOSToolchain-x86_64.tar.xz" \
+            -o /tmp/ios-toolchain.tar.xz
+          tar -xf /tmp/ios-toolchain.tar.xz -C "$THEOS/toolchain"
+          ls "$THEOS/toolchain/linux/iphone/bin" | head -20
+
+      - name: Install iPhoneOS 9.3 SDK
+        run: |
+          mkdir -p "$THEOS/sdks"
+          curl -fsSL -o /tmp/iphoneos9.3.sdk.tbz2 \
+            "https://raw.githubusercontent.com/Sn0wCooder/theos-sdks/master/iPhoneOS9.3.sdk.tbz2"
+          tar -xjf /tmp/iphoneos9.3.sdk.tbz2 -C "$THEOS/sdks"
+          ls "$THEOS/sdks"
+
+      - name: Fix legacy module maps in SDK (clang 19)
+        run: |
+          SDK="$THEOS/sdks/iPhoneOS9.3.sdk"
+          for fw in "$SDK"/System/Library/Frameworks/*.framework; do
+            if [ -f "$fw/module.map" ]; then
+              mkdir -p "$fw/Modules"
+              mv "$fw/module.map" "$fw/Modules/module.modulemap"
+            fi
+          done
+          find "$SDK/usr/include" -name module.map | while read -r m; do
+            mv "$m" "$(dirname "$m")/module.modulemap"
+          done
+
+      - name: Locate BStone sources (or clone upstream)
+        run: |
+          ROOT=$(find . -maxdepth 3 -path ./theos -prune -o -path '*/src/bstone/CMakeLists.txt' -print | head -n1)
+          if [ -z "$ROOT" ]; then
+            echo "No BStone sources in the repository: cloning upstream master"
+            git clone --depth 1 https://github.com/bibendovsky/bstone.git bstone-upstream
+            ROOT=bstone-upstream/src/bstone/CMakeLists.txt
+          fi
+          BS_ROOT=$(cd "$(dirname "$ROOT")/../.." && pwd)
+          echo "BS_ROOT=$BS_ROOT" | tee -a "$GITHUB_ENV"
+          ls "$BS_ROOT"
+
+      - name: Write the iOS port (ios/)
+        working-directory: ${{ env.BS_ROOT }}
+        run: |
+          set -e
+          mkdir -p "$(dirname 'ios/Makefile')"
+          cat > 'ios/Makefile' <<'BSIOS_EOF'
+          # BStone for 32-bit iOS 7+ (armv7, OpenGL ES 2.0) -- Theos application.
+          #
+          # Same toolchain approach as the zelda3 armv7 port: iPhoneOS 9.3 SDK, modern clang, but the deployment
+          # target is lowered to 7.0 (only APIs available on iOS 7 are used: UIAlertView, AudioQueue, EAGL...).
+          #
+          #   export THEOS=~/theos ; make package        (run in this directory)
+          TARGET := iphone:clang:9.3:7.0
+          ARCHS = armv7
+
+          export ADDITIONAL_OBJCFLAGS += -Wno-error=deprecated-module-dot-map -Wno-deprecated-module-dot-map
+
+          include $(THEOS)/makefiles/common.mk
+          include sources.mk
+
+          # bstone_version_.h replaces CMake's configure_file().
+          GEN_DIR = $(THEOS_PROJECT_DIR)/.theos/gen
+          $(shell $(THEOS_PROJECT_DIR)/tools/gen_version.sh $(GEN_DIR))
+
+          APPLICATION_NAME = BStoneiOS7
+
+          BStoneiOS7_FILES = \
+          	$(BSTONE_ENGINE_FILES) \
+          	$(BSTONE_LIB_FILES) \
+          	$(wildcard src/sys/*.cpp) \
+          	$(wildcard src/app/*.mm)
+
+          BS_INCLUDES = \
+          	-I$(THEOS_PROJECT_DIR)/src -I$(THEOS_PROJECT_DIR)/src/sys \
+          	-I$(THEOS_PROJECT_DIR)/../src/bstone/src -I$(THEOS_PROJECT_DIR)/../src/bstone/src/dosbox \
+          	-I$(GEN_DIR) \
+          	-I$(THEOS_PROJECT_DIR)/../src/lib/khronos/include \
+          	-I$(THEOS_PROJECT_DIR)/../src/lib/nuked_opl3/include \
+          	-I$(THEOS_PROJECT_DIR)/../src/lib/openal_soft/include/AL \
+          	-I$(THEOS_PROJECT_DIR)/../src/lib/stb/include \
+          	-I$(THEOS_PROJECT_DIR)/../src/lib/xbrz/include \
+          	-I$(THEOS_PROJECT_DIR)/../src/lib/vulkan/include
+
+          BS_WARN = -Wno-deprecated-declarations -Wno-unknown-warning-option -Wno-unused-command-line-argument \
+          	-Wno-error=deprecated-module-dot-map -Wno-deprecated-module-dot-map \
+          	-Wno-error=incomplete-umbrella -Wno-incomplete-umbrella \
+          	-Wno-error=non-modular-include-in-framework-module -Wno-non-modular-include-in-framework-module \
+          	-Wno-error=non-modular-include-in-module -Wno-non-modular-include-in-module
+
+          BStoneiOS7_CFLAGS = -O2 -DNDEBUG -DBSTONE_IOS=1 -DVK_NO_PROTOTYPES -fno-strict-aliasing \
+          	$(BS_INCLUDES) $(BS_WARN)
+          # C++14 only: libc++ of the 9.3 SDK, nothing newer than iOS 7 runtime features (no thread_local, no clock_gettime).
+          BStoneiOS7_CXXFLAGS = -std=gnu++14 -stdlib=libc++
+          BStoneiOS7_OBJCFLAGS = -fobjc-arc
+          BStoneiOS7_LDFLAGS = -stdlib=libc++
+          BStoneiOS7_FRAMEWORKS = UIKit Foundation CoreGraphics QuartzCore OpenGLES AudioToolbox AVFoundation
+          BStoneiOS7_CODESIGN_FLAGS = -Sentitlements.plist
+
+          include $(THEOS_MAKE_PATH)/application.mk
+          BSIOS_EOF
+          mkdir -p "$(dirname 'ios/Resources/Info.plist')"
+          cat > 'ios/Resources/Info.plist' <<'BSIOS_EOF'
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0">
+          <dict>
+          	<key>CFBundleIdentifier</key><string>org.bibendovsky.bstone.ios7</string>
+          	<key>CFBundleName</key><string>BStone</string>
+          	<key>CFBundleDisplayName</key><string>BStone</string>
+          	<key>CFBundleExecutable</key><string>BStoneiOS7</string>
+          	<key>CFBundleVersion</key><string>1.3.4</string>
+          	<key>CFBundleShortVersionString</key><string>1.3.4</string>
+          	<key>CFBundlePackageType</key><string>APPL</string>
+          	<key>CFBundleInfoDictionaryVersion</key><string>6.0</string>
+          	<key>MinimumOSVersion</key><string>7.0</string>
+          	<key>LSRequiresIPhoneOS</key><true/>
+          	<key>UIRequiredDeviceCapabilities</key><array><string>armv7</string><string>opengles-2</string></array>
+          	<key>UIDeviceFamily</key><array><integer>1</integer><integer>2</integer></array>
+          	<key>UIStatusBarHidden</key><true/>
+          	<key>UIViewControllerBasedStatusBarAppearance</key><false/>
+          	<key>UIRequiresFullScreen</key><true/>
+          	<key>UISupportedInterfaceOrientations</key>
+          	<array><string>UIInterfaceOrientationLandscapeRight</string><string>UIInterfaceOrientationLandscapeLeft</string></array>
+          	<key>UISupportedInterfaceOrientations~ipad</key>
+          	<array><string>UIInterfaceOrientationLandscapeRight</string><string>UIInterfaceOrientationLandscapeLeft</string></array>
+          	<key>UIFileSharingEnabled</key><true/>
+          	<key>UIPrerenderedIcon</key><true/>
+          </dict>
+          </plist>
+          BSIOS_EOF
+          mkdir -p "$(dirname 'ios/control')"
+          cat > 'ios/control' <<'BSIOS_EOF'
+          Package: org.bibendovsky.bstone.ios7
+          Name: BStone
+          Version: 1.3.4-ios7
+          Architecture: iphoneos-arm
+          Description: BStone (Blake Stone: Aliens of Gold / Planet Strike source port) for 32-bit iOS 7+ (armv7, OpenGL ES 2.0)
+          Maintainer: BStone iOS port
+          Author: Boris I. Bendovsky and contributors
+          Section: Games
+          Depends: firmware (>= 7.0)
+          BSIOS_EOF
+          mkdir -p "$(dirname 'ios/entitlements.plist')"
+          cat > 'ios/entitlements.plist' <<'BSIOS_EOF'
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0"><dict>
+          	<key>platform-application</key><true/>
+          	<key>get-task-allow</key><true/>
+          </dict></plist>
+          BSIOS_EOF
+          mkdir -p "$(dirname 'ios/src/app/BSAppDelegate.h')"
+          cat > 'ios/src/app/BSAppDelegate.h' <<'BSIOS_EOF'
+          #import <UIKit/UIKit.h>
+          @interface BSAppDelegate : UIResponder <UIApplicationDelegate>
+          @property (strong, nonatomic) UIWindow* window;
+          @end
+          BSIOS_EOF
+          mkdir -p "$(dirname 'ios/src/app/BSAppDelegate.mm')"
+          cat > 'ios/src/app/BSAppDelegate.mm' <<'BSIOS_EOF'
+          #import "BSAppDelegate.h"
+          #import "BSGameViewController.h"
+          #import "BSHost.h"
+          #import <AVFoundation/AVFoundation.h>
+          #include "bsios_bridge.h"
+
+          @implementation BSAppDelegate
+
+          - (BOOL)application:(UIApplication*)application didFinishLaunchingWithOptions:(NSDictionary*)launchOptions {
+          	BSHost_LoadConfig();
+          	application.idleTimerDisabled = YES;
+          	self.window = [[UIWindow alloc] initWithFrame:[UIScreen mainScreen].bounds];
+          	self.window.backgroundColor = [UIColor blackColor];
+          	self.window.rootViewController = [[BSGameViewController alloc] init];
+          	[self.window makeKeyAndVisible];
+
+          	[[NSNotificationCenter defaultCenter] addObserverForName:AVAudioSessionInterruptionNotification
+          	    object:nil queue:[NSOperationQueue mainQueue] usingBlock:^(NSNotification* n) {
+          		NSUInteger type = [n.userInfo[AVAudioSessionInterruptionTypeKey] unsignedIntegerValue];
+          		BSAudio_SetSuspended(type == AVAudioSessionInterruptionTypeBegan);
+          	}];
+          	return YES;
+          }
+
+          - (void)applicationWillResignActive:(UIApplication*)application {
+          	bsios_event_push_focus(0);
+          	BSAudio_SetSuspended(YES);
+          	BSHost_SetActive(NO);
+          	// GL must be idle before we return to the system; the game thread parks in bsios_gl_swap().
+          	BSHost_WaitUntilParked(300);
+          }
+
+          - (void)applicationDidBecomeActive:(UIApplication*)application {
+          	BSHost_SetActive(YES);
+          	BSAudio_SetSuspended(NO);
+          	bsios_event_push_focus(1);
+          }
+
+          - (void)applicationDidReceiveMemoryWarning:(UIApplication*)application {
+          	NSLog(@"BStone: memory warning");
+          }
+
+          @end
+          BSIOS_EOF
+          mkdir -p "$(dirname 'ios/src/app/BSAudio.mm')"
+          cat > 'ios/src/app/BSAudio.mm' <<'BSIOS_EOF'
+          // BSAudio.mm -- AudioQueue output (bsios_audio_*). AudioQueue has been stable since iOS 2 and needs no
+          // session graph. The mixer callback is invoked directly on the queue's own thread.
+          //
+          // Buffers are filled only after the game un-pauses the device for the first time: BStone opens the
+          // device while its mixer is still being constructed, so the callback must not run before that.
+          #import "BSHost.h"
+          #import <AudioToolbox/AudioToolbox.h>
+          #import <AVFoundation/AVFoundation.h>
+
+          #include <string.h>
+          #include "bsios_bridge.h"
+
+          enum { kBufferCount = 3 };
+
+          static AudioQueueRef g_queue;
+          static AudioQueueBufferRef g_buffers[kBufferCount];
+          static bsios_audio_callback g_callback;
+          static void* g_user_data;
+          static int g_channels, g_frames;
+          static BOOL g_primed;
+          static BOOL g_game_paused = YES;     // the game's own pause flag
+          static BOOL g_suspended;             // application state
+          static BOOL g_running;               // queue actually started
+          static NSObject* g_lock;
+
+          static void FillBuffer(AudioQueueBufferRef buf) {
+          	const int sample_count = g_frames * g_channels;
+          	buf->mAudioDataByteSize = (UInt32)(sample_count * sizeof(float));
+          	if (g_callback)
+          		g_callback(g_user_data, (float*)buf->mAudioData, sample_count);
+          	else
+          		memset(buf->mAudioData, 0, buf->mAudioDataByteSize);
+          }
+
+          static void OutputCallback(void*, AudioQueueRef queue, AudioQueueBufferRef buf) {
+          	FillBuffer(buf);
+          	AudioQueueEnqueueBuffer(queue, buf, 0, NULL);
+          }
+
+          static BOOL ActivateSession(void) {
+          	AVAudioSession* session = [AVAudioSession sharedInstance];
+          	NSError* err = nil;
+          	[session setCategory:AVAudioSessionCategoryAmbient error:&err];
+          	if (err) { NSLog(@"BStone audio: setCategory failed: %@", err); return NO; }
+          	err = nil;
+          	[session setActive:YES error:&err];
+          	if (err) { NSLog(@"BStone audio: setActive failed: %@", err); return NO; }
+          	return YES;
+          }
+
+          // Must be called with g_lock held.
+          static void UpdateRunningLocked(void) {
+          	if (!g_queue) return;
+          	BOOL want = !g_game_paused && !g_suspended;
+          	if (want && !g_running) {
+          		if (!g_primed) {
+          			for (int i = 0; i < kBufferCount; i++) {
+          				FillBuffer(g_buffers[i]);
+          				AudioQueueEnqueueBuffer(g_queue, g_buffers[i], 0, NULL);
+          			}
+          			g_primed = YES;
+          		}
+          		if (AudioQueueStart(g_queue, NULL) == noErr) g_running = YES;
+          	} else if (!want && g_running) {
+          		AudioQueuePause(g_queue);
+          		g_running = NO;
+          	}
+          }
+
+          extern "C" int bsios_audio_open(int desired_rate, int channel_count, int desired_frame_count,
+                                          bsios_audio_callback callback, void* user_data,
+                                          int* effective_rate, int* effective_frame_count) {
+          	static dispatch_once_t once;
+          	dispatch_once(&once, ^{ g_lock = [[NSObject alloc] init]; });
+
+          	@synchronized (g_lock) {
+          		if (g_queue) return -1;
+          		if (!ActivateSession()) return -2;
+
+          		AudioStreamBasicDescription fmt;
+          		memset(&fmt, 0, sizeof(fmt));
+          		fmt.mSampleRate = desired_rate;
+          		fmt.mFormatID = kAudioFormatLinearPCM;
+          		fmt.mFormatFlags = kAudioFormatFlagIsFloat | kAudioFormatFlagIsPacked;   // native-endian Float32
+          		fmt.mBitsPerChannel = 32;
+          		fmt.mChannelsPerFrame = (UInt32)channel_count;
+          		fmt.mBytesPerFrame = (UInt32)(channel_count * sizeof(float));
+          		fmt.mFramesPerPacket = 1;
+          		fmt.mBytesPerPacket = fmt.mBytesPerFrame;
+
+          		g_callback = callback;
+          		g_user_data = user_data;
+          		g_channels = channel_count;
+          		g_frames = desired_frame_count;
+
+          		// NULL run loop: the queue uses its own internal thread for the callback (a main run loop here
+          		// is a known cause of multi-second hangs in AudioQueueStop).
+          		OSStatus st = AudioQueueNewOutput(&fmt, OutputCallback, NULL, NULL, NULL, 0, &g_queue);
+          		if (st != noErr) { g_queue = NULL; return (int)st; }
+
+          		for (int i = 0; i < kBufferCount; i++) {
+          			st = AudioQueueAllocateBuffer(g_queue, (UInt32)(g_frames * g_channels * sizeof(float)), &g_buffers[i]);
+          			if (st != noErr) { AudioQueueDispose(g_queue, true); g_queue = NULL; return (int)st; }
+          		}
+
+          		g_primed = NO;
+          		g_running = NO;
+          		g_game_paused = YES;
+          		*effective_rate = desired_rate;
+          		*effective_frame_count = desired_frame_count;
+          	}
+          	return 0;
+          }
+
+          extern "C" void bsios_audio_pause(int is_paused) {
+          	@synchronized (g_lock) {
+          		g_game_paused = is_paused != 0;
+          		UpdateRunningLocked();
+          	}
+          }
+
+          extern "C" void bsios_audio_close(void) {
+          	AudioQueueRef q;
+          	@synchronized (g_lock) {
+          		q = g_queue;
+          		g_queue = NULL;
+          		g_running = NO;
+          		g_primed = NO;
+          		g_callback = NULL;
+          	}
+          	if (q) {
+          		// Synchronous stop: safe, the callback runs on the queue's own thread, not on ours.
+          		AudioQueueStop(q, true);
+          		AudioQueueDispose(q, true);
+          	}
+          }
+
+          void BSAudio_SetSuspended(BOOL suspended) {
+          	if (!g_lock) return;   // audio not opened yet
+          	if (!suspended) ActivateSession();   // after an interruption the session must be re-activated
+          	@synchronized (g_lock) {
+          		g_suspended = suspended;
+          		UpdateRunningLocked();
+          	}
+          }
+          BSIOS_EOF
+          mkdir -p "$(dirname 'ios/src/app/BSGL.mm')"
+          cat > 'ios/src/app/BSGL.mm' <<'BSIOS_EOF'
+          // BSGL.mm -- OpenGL ES 2.0 part of bsios_bridge.h.
+          //
+          // iOS has no default framebuffer: a framebuffer object with a color renderbuffer allocated from the
+          // CAEAGLLayer plays that role. (The C++ symbol resolver maps glBindFramebuffer(.., 0) to it.)
+          //
+          // Threading: everything here runs on the game thread, which owns the EAGLContext. The main thread
+          // is never blocked.
+          #import "BSHost.h"
+          #import "BSGLView.h"
+
+          #import <OpenGLES/EAGL.h>
+          #import <OpenGLES/ES2/gl.h>
+          #import <OpenGLES/ES2/glext.h>
+          #import <QuartzCore/QuartzCore.h>
+
+          #include "bsios_bridge.h"
+
+          static EAGLContext* g_ctx;
+          static GLuint g_fbo, g_color_rb, g_depth_rb;
+          static GLint g_w, g_h;
+
+          static void DestroyGLObjects(void) {
+          	if (!g_ctx) return;
+          	[EAGLContext setCurrentContext:g_ctx];
+          	if (g_depth_rb) glDeleteRenderbuffers(1, &g_depth_rb);
+          	if (g_color_rb) glDeleteRenderbuffers(1, &g_color_rb);
+          	if (g_fbo) glDeleteFramebuffers(1, &g_fbo);
+          	g_depth_rb = g_color_rb = g_fbo = 0;
+          	glFinish();
+          	[EAGLContext setCurrentContext:nil];
+          	g_ctx = nil;
+          	g_w = g_h = 0;
+          }
+
+          extern "C" void bsios_gl_destroy(void) {
+          	DestroyGLObjects();
+          }
+
+          extern "C" int bsios_gl_create(int depth_bits) {
+          	DestroyGLObjects();
+
+          	BSGLView* view = BSHost_GLView();
+          	if (!view) return -1;
+
+          	g_ctx = [[EAGLContext alloc] initWithAPI:kEAGLRenderingAPIOpenGLES2];
+          	if (!g_ctx || ![EAGLContext setCurrentContext:g_ctx]) {
+          		g_ctx = nil;
+          		return -2;
+          	}
+
+          	glGenFramebuffers(1, &g_fbo);
+          	glGenRenderbuffers(1, &g_color_rb);
+          	glBindFramebuffer(GL_FRAMEBUFFER, g_fbo);
+          	glBindRenderbuffer(GL_RENDERBUFFER, g_color_rb);
+
+          	if (![g_ctx renderbufferStorage:GL_RENDERBUFFER fromDrawable:(CAEAGLLayer*)view.layer]) {
+          		DestroyGLObjects();
+          		return -3;
+          	}
+          	glGetRenderbufferParameteriv(GL_RENDERBUFFER, GL_RENDERBUFFER_WIDTH, &g_w);
+          	glGetRenderbufferParameteriv(GL_RENDERBUFFER, GL_RENDERBUFFER_HEIGHT, &g_h);
+          	glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_RENDERBUFFER, g_color_rb);
+
+          	if (depth_bits > 0) {
+          		glGenRenderbuffers(1, &g_depth_rb);
+          		glBindRenderbuffer(GL_RENDERBUFFER, g_depth_rb);
+          		// 24-bit depth (GL_OES_depth24) exists on every iOS 7 capable GPU, but 16 bits is what
+          		// the renderer asks for and is cheaper on the tile-based SGX parts.
+          		glRenderbufferStorage(GL_RENDERBUFFER, depth_bits > 16 ? GL_DEPTH_COMPONENT24_OES : GL_DEPTH_COMPONENT16,
+          		                      g_w, g_h);
+          		glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_DEPTH_ATTACHMENT, GL_RENDERBUFFER, g_depth_rb);
+          	}
+
+          	if (glCheckFramebufferStatus(GL_FRAMEBUFFER) != GL_FRAMEBUFFER_COMPLETE) {
+          		DestroyGLObjects();
+          		return -4;
+          	}
+
+          	glViewport(0, 0, g_w, g_h);
+          	return 0;
+          }
+
+          extern "C" void bsios_gl_get_drawable_size(int* width, int* height) {
+          	*width = g_w;
+          	*height = g_h;
+          }
+
+          extern "C" unsigned int bsios_gl_get_default_framebuffer(void) {
+          	return g_fbo;
+          }
+
+          extern "C" void bsios_gl_swap(void) {
+          	if (!g_ctx) return;
+          	// iOS terminates apps that issue GL commands while in background: wait here while inactive.
+          	// glFinish() runs right before parking, so all queued GL work is complete when the main thread
+          	// (BSHost_WaitUntilParked) lets the app go to background.
+          	BSHost_ParkIfInactive(&glFinish);
+          	glBindRenderbuffer(GL_RENDERBUFFER, g_color_rb);
+          	[g_ctx presentRenderbuffer:GL_RENDERBUFFER];
+          }
+          BSIOS_EOF
+          mkdir -p "$(dirname 'ios/src/app/BSGLView.h')"
+          cat > 'ios/src/app/BSGLView.h' <<'BSIOS_EOF'
+          // BSGLView.h -- the full-screen view whose CAEAGLLayer receives the game's frames.
+          #import <UIKit/UIKit.h>
+
+          @interface BSGLView : UIView
+          @end
+          BSIOS_EOF
+          mkdir -p "$(dirname 'ios/src/app/BSGLView.mm')"
+          cat > 'ios/src/app/BSGLView.mm' <<'BSIOS_EOF'
+          // BSGLView.mm
+          #import "BSGLView.h"
+          #import "BSHost.h"
+          #import <QuartzCore/QuartzCore.h>
+
+          @implementation BSGLView
+
+          + (Class)layerClass { return [CAEAGLLayer class]; }
+
+          - (instancetype)initWithFrame:(CGRect)frame {
+          	if ((self = [super initWithFrame:frame])) {
+          		self.backgroundColor = [UIColor blackColor];
+          		self.opaque = YES;
+          		self.multipleTouchEnabled = NO;          // touches are handled by the overlay on top
+
+          		CAEAGLLayer* layer = (CAEAGLLayer*)self.layer;
+          		layer.opaque = YES;
+          		layer.drawableProperties = @{
+          			kEAGLDrawablePropertyRetainedBacking : @NO,
+          			kEAGLDrawablePropertyColorFormat : kEAGLColorFormatRGBA8,
+          		};
+
+          		// Drawable pixels per point. The game renders its 3D view at drawable resolution, so a
+          		// scale below the screen scale is a cheap way to speed up fill-rate-bound devices
+          		// (iPad 3 / 4, A5-A6 iPhones). Configure with render_scale= in bstone_ios.ini.
+          		BSConfig cfg = BSHost_GetConfig();
+          		CGFloat scale = cfg.render_scale > 0 ? cfg.render_scale : [UIScreen mainScreen].scale;
+          		self.contentScaleFactor = scale;
+          		layer.contentsScale = scale;
+          	}
+          	return self;
+          }
+
+          - (void)layoutSubviews {
+          	[super layoutSubviews];
+          	CGSize s = self.bounds.size;
+          	CGFloat scale = self.contentScaleFactor;
+          	int w = (int)(MAX(s.width, s.height) * scale + 0.5);   // always landscape
+          	int h = (int)(MIN(s.width, s.height) * scale + 0.5);
+          	BSHost_SetViewPixelSize(w, h);
+          }
+
+          @end
+          BSIOS_EOF
+          mkdir -p "$(dirname 'ios/src/app/BSGameViewController.h')"
+          cat > 'ios/src/app/BSGameViewController.h' <<'BSIOS_EOF'
+          #import <UIKit/UIKit.h>
+          @interface BSGameViewController : UIViewController
+          @end
+          BSIOS_EOF
+          mkdir -p "$(dirname 'ios/src/app/BSGameViewController.mm')"
+          cat > 'ios/src/app/BSGameViewController.mm' <<'BSIOS_EOF'
+          #import "BSGameViewController.h"
+          #import "BSGLView.h"
+          #import "BSTouchOverlay.h"
+          #import "BSHost.h"
+
+          @implementation BSGameViewController {
+          	BSGLView* _glView;
+          	BSTouchOverlay* _overlay;
+          	BOOL _started;
+          }
+
+          - (void)loadView {
+          	UIView* root = [[UIView alloc] initWithFrame:[UIScreen mainScreen].bounds];
+          	root.backgroundColor = [UIColor blackColor];
+          	root.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
+          	self.view = root;
+
+          	_glView = [[BSGLView alloc] initWithFrame:root.bounds];
+          	_glView.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
+          	[root addSubview:_glView];
+          	BSHost_SetGLView(_glView);
+
+          	_overlay = [[BSTouchOverlay alloc] initWithFrame:root.bounds];
+          	_overlay.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
+          	_overlay.hidden = !BSHost_GetConfig().touch_controls;
+          	[root addSubview:_overlay];
+          }
+
+          - (void)viewDidAppear:(BOOL)animated {
+          	[super viewDidAppear:animated];
+          	if (_started) return;
+          	_started = YES;
+          	[self.view layoutIfNeeded];          // the pixel size must be known before the game asks for it
+          	BSHost_StartGame();
+          }
+
+          - (NSUInteger)supportedInterfaceOrientations { return UIInterfaceOrientationMaskLandscape; }
+          - (BOOL)shouldAutorotate { return YES; }
+          - (BOOL)prefersStatusBarHidden { return YES; }
+
+          @end
+          BSIOS_EOF
+          mkdir -p "$(dirname 'ios/src/app/BSHost.h')"
+          cat > 'ios/src/app/BSHost.h' <<'BSIOS_EOF'
+          // BSHost.h -- shared state between the UIKit layer and the bridge implementation (BSHost.mm, BSGL.mm,
+          // BSAudio.mm). Objective-C++, ARC, iOS 7.0+ (armv7).
+          #import <UIKit/UIKit.h>
+
+          @class BSGLView;
+
+          #ifdef __cplusplus
+          extern "C" {
+          #endif
+
+          // ---- configuration (Documents/bstone_ios.ini) ----
+          typedef struct BSConfig {
+          	float render_scale;       // drawable pixels per point; 0 = "use the screen scale"
+          	int touch_controls;       // 1 = draw the on-screen controls
+          	int show_fps_hint;        // reserved
+          } BSConfig;
+
+          BSConfig BSHost_GetConfig(void);
+          void BSHost_LoadConfig(void);
+
+          // ---- paths ----
+          NSString* BSHost_DocumentsPath(void);   // with trailing slash
+
+          // ---- game thread ----
+          // Builds argv (data_dir/profile_dir + user "args=") and starts the game thread. Call once, from the main thread.
+          void BSHost_StartGame(void);
+          BOOL BSHost_IsGameRunning(void);
+
+          // ---- view ----
+          // The game view is created on the main thread; the game thread only reads its pixel size.
+          void BSHost_SetGLView(BSGLView* view);
+          BSGLView* BSHost_GLView(void);
+          void BSHost_SetViewPixelSize(int width, int height);
+
+          // ---- activity (application state) ----
+          // While inactive the game thread parks inside bsios_gl_swap() (iOS forbids GL calls in background).
+          void BSHost_SetActive(BOOL active);
+          // Waits (at most timeout_ms) until the game thread is parked or has finished. Main thread only.
+          void BSHost_WaitUntilParked(int timeout_ms);
+
+          // ---- audio (BSAudio.mm) ----
+          void BSAudio_SetSuspended(BOOL suspended);   // application state: background / interruption
+
+          // ---- GL (BSGL.mm) ----
+          // Parking support: called by the game thread from bsios_gl_swap().
+          void BSHost_ParkIfInactive(void (*before_park)(void));
+
+          #ifdef __cplusplus
+          }
+          #endif
+          BSIOS_EOF
+          mkdir -p "$(dirname 'ios/src/app/BSHost.mm')"
+          cat > 'ios/src/app/BSHost.mm' <<'BSIOS_EOF'
+          // BSHost.mm -- implementation of the non-GL, non-audio part of bsios_bridge.h plus the game thread.
+          #import "BSHost.h"
+          #import "BSGLView.h"
+
+          #include <atomic>
+          #include <pthread.h>
+          #include <stdlib.h>
+          #include <string.h>
+          #include <sys/stat.h>
+          #include <dispatch/dispatch.h>
+
+          #include "bsios_bridge.h"
+
+          // ---------------------------------------------------------------------------
+          // State
+          // ---------------------------------------------------------------------------
+          static BSConfig g_config = {1.0f, 1, 0};
+
+          static BSGLView* g_gl_view;                    // strong; set once on the main thread before the game starts
+          static std::atomic<int> g_view_px_w(0);
+          static std::atomic<int> g_view_px_h(0);
+
+          static std::atomic<int> g_game_running(0);
+          static std::atomic<int> g_game_finished(0);
+
+          static NSCondition* g_active_cond;             // guards g_is_active / g_is_parked
+          static BOOL g_is_active = YES;
+          static BOOL g_is_parked = NO;
+
+          static NSMutableArray* g_argv_storage;         // keeps the C strings of argv alive
+
+          // ---------------------------------------------------------------------------
+          // Config
+          // ---------------------------------------------------------------------------
+          BSConfig BSHost_GetConfig(void) { return g_config; }
+
+          NSString* BSHost_DocumentsPath(void) {
+          	NSString* dir = NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES).firstObject;
+          	if (![dir hasSuffix:@"/"]) dir = [dir stringByAppendingString:@"/"];
+          	return dir;
+          }
+
+          static NSString* ReadIniValue(NSString* ini, NSString* key) {
+          	for (NSString* rawLine in [ini componentsSeparatedByCharactersInSet:[NSCharacterSet newlineCharacterSet]]) {
+          		NSString* line = [rawLine stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceCharacterSet]];
+          		if (line.length == 0 || [line hasPrefix:@"#"] || [line hasPrefix:@";"]) continue;
+          		NSRange eq = [line rangeOfString:@"="];
+          		if (eq.location == NSNotFound) continue;
+          		NSString* k = [[line substringToIndex:eq.location] stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceCharacterSet]];
+          		if ([k caseInsensitiveCompare:key] != NSOrderedSame) continue;
+          		return [[line substringFromIndex:eq.location + 1] stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceCharacterSet]];
+          	}
+          	return nil;
+          }
+
+          static NSString* LoadIniText(void) {
+          	NSString* path = [BSHost_DocumentsPath() stringByAppendingString:@"bstone_ios.ini"];
+          	return [NSString stringWithContentsOfFile:path encoding:NSUTF8StringEncoding error:nil];
+          }
+
+          void BSHost_LoadConfig(void) {
+          	g_config.render_scale = 1.0f;
+          	g_config.touch_controls = 1;
+          	NSString* ini = LoadIniText();
+          	if (!ini) return;
+          	NSString* v;
+          	if ((v = ReadIniValue(ini, @"render_scale"))) {
+          		float f = [v floatValue];
+          		if (f >= 0.0f && f <= 4.0f) g_config.render_scale = f;
+          	}
+          	if ((v = ReadIniValue(ini, @"touch_controls"))) g_config.touch_controls = [v intValue] != 0;
+          }
+
+          // ---------------------------------------------------------------------------
+          // View / activity
+          // ---------------------------------------------------------------------------
+          void BSHost_SetGLView(BSGLView* view) { g_gl_view = view; }
+          BSGLView* BSHost_GLView(void) { return g_gl_view; }
+
+          void BSHost_SetViewPixelSize(int w, int h) {
+          	g_view_px_w.store(w);
+          	g_view_px_h.store(h);
+          }
+
+          static void EnsureCond(void) {
+          	static dispatch_once_t once;
+          	dispatch_once(&once, ^{ g_active_cond = [[NSCondition alloc] init]; });
+          }
+
+          void BSHost_SetActive(BOOL active) {
+          	EnsureCond();
+          	[g_active_cond lock];
+          	g_is_active = active;
+          	[g_active_cond broadcast];
+          	[g_active_cond unlock];
+          }
+
+          void BSHost_ParkIfInactive(void (*before_park)(void)) {
+          	EnsureCond();
+          	[g_active_cond lock];
+          	if (!g_is_active && before_park) before_park();   // e.g. glFinish(): GL work must be complete when we park
+          	while (!g_is_active) {
+          		g_is_parked = YES;
+          		[g_active_cond broadcast];
+          		[g_active_cond wait];
+          	}
+          	g_is_parked = NO;
+          	[g_active_cond unlock];
+          }
+
+          void BSHost_WaitUntilParked(int timeout_ms) {
+          	EnsureCond();
+          	if (!g_game_running.load() || g_game_finished.load()) return;
+          	NSDate* deadline = [NSDate dateWithTimeIntervalSinceNow:timeout_ms / 1000.0];
+          	[g_active_cond lock];
+          	while (!g_is_parked && !g_game_finished.load()) {
+          		if (![g_active_cond waitUntilDate:deadline]) break;   // timed out: never block the main thread for long
+          	}
+          	[g_active_cond unlock];
+          }
+
+          BOOL BSHost_IsGameRunning(void) { return g_game_running.load() != 0 && g_game_finished.load() == 0; }
+
+          // ---------------------------------------------------------------------------
+          // bsios_bridge.h: screen / files
+          // ---------------------------------------------------------------------------
+          extern "C" void bsios_screen_get_size(int* width, int* height) {
+          	int w = g_view_px_w.load(), h = g_view_px_h.load();
+          	if (w <= 0 || h <= 0) {   // before the first layout: derive from the screen (landscape)
+          		CGRect b = [UIScreen mainScreen].bounds;
+          		CGFloat s = g_config.render_scale > 0 ? g_config.render_scale : [UIScreen mainScreen].scale;
+          		w = (int)(MAX(b.size.width, b.size.height) * s);
+          		h = (int)(MIN(b.size.width, b.size.height) * s);
+          	}
+          	*width = w;
+          	*height = h;
+          }
+
+          extern "C" int bsios_screen_get_refresh_rate(void) { return 60; }
+
+          extern "C" int bsios_get_documents_path(char* buffer, size_t buffer_size) {
+          	const char* p = BSHost_DocumentsPath().fileSystemRepresentation;
+          	size_t n = strlen(p);
+          	bool slash = n == 0 || p[n - 1] != '/';
+          	if (n + (slash ? 1 : 0) + 1 > buffer_size) return -1;
+          	memcpy(buffer, p, n);
+          	if (slash) buffer[n++] = '/';
+          	buffer[n] = 0;
+          	return (int)n;
+          }
+
+          // ---------------------------------------------------------------------------
+          // Message box (UIAlertView: UIAlertController does not exist before iOS 8)
+          // ---------------------------------------------------------------------------
+          @interface BSAlertWaiter : NSObject <UIAlertViewDelegate>
+          @property (nonatomic) dispatch_semaphore_t semaphore;
+          @property (nonatomic) NSInteger result;
+          @end
+
+          @implementation BSAlertWaiter
+          - (void)alertView:(UIAlertView*)alertView clickedButtonAtIndex:(NSInteger)buttonIndex {
+          	self.result = buttonIndex;
+          	dispatch_semaphore_signal(self.semaphore);
+          }
+          - (void)alertViewCancel:(UIAlertView*)alertView {
+          	self.result = 0;
+          	dispatch_semaphore_signal(self.semaphore);
+          }
+          @end
+
+          extern "C" int bsios_message_box(const char* title, const char* message,
+                                           const char* const* button_titles, int button_count) {
+          	if (button_count <= 0) return -1;
+          	NSString* t = [NSString stringWithUTF8String:title ? title : ""];
+          	NSString* m = [NSString stringWithUTF8String:message ? message : ""];
+          	NSMutableArray* titles = [NSMutableArray array];
+          	for (int i = 0; i < button_count; i++)
+          		[titles addObject:[NSString stringWithUTF8String:button_titles[i] ? button_titles[i] : ""]];
+
+          	BSAlertWaiter* waiter = [[BSAlertWaiter alloc] init];
+          	waiter.semaphore = dispatch_semaphore_create(0);
+          	waiter.result = -1;
+
+          	// Asynchronous hop: the game thread must never dispatch_sync() to the main thread.
+          	dispatch_async(dispatch_get_main_queue(), ^{
+          		UIAlertView* av = [[UIAlertView alloc] initWithTitle:t message:m delegate:waiter
+          		                                   cancelButtonTitle:titles[0] otherButtonTitles:nil];
+          		for (NSUInteger i = 1; i < titles.count; i++) [av addButtonWithTitle:titles[i]];
+          		[av show];
+          	});
+          	dispatch_semaphore_wait(waiter.semaphore, DISPATCH_TIME_FOREVER);
+          	return (int)waiter.result;
+          }
+
+          // ---------------------------------------------------------------------------
+          // Game thread
+          // ---------------------------------------------------------------------------
+          static void* GameThreadMain(void*) {
+          	@autoreleasepool {
+          		int argc = (int)g_argv_storage.count;
+          		char** argv = (char**)calloc((size_t)argc + 1, sizeof(char*));
+          		for (int i = 0; i < argc; i++) argv[i] = (char*)[g_argv_storage[i] UTF8String];
+          		int rc = bstone_game_main(argc, argv);
+          		free(argv);
+          		g_game_finished.store(1);
+          		EnsureCond();
+          		[g_active_cond lock]; [g_active_cond broadcast]; [g_active_cond unlock];
+          		bsios_game_finished(rc);
+          	}
+          	return NULL;
+          }
+
+          extern "C" void bsios_game_finished(int exit_code) {
+          	// The game's own "Quit" ends here. A well-behaved iOS app normally never quits itself, but a
+          	// game that has been told to quit has nothing left to show.
+          	dispatch_async(dispatch_get_main_queue(), ^{
+          		dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.3 * NSEC_PER_SEC)),
+          		               dispatch_get_main_queue(), ^{ exit(exit_code); });
+          	});
+          }
+
+          void BSHost_StartGame(void) {
+          	if (g_game_running.exchange(1)) return;
+          	EnsureCond();
+
+          	NSString* docs = BSHost_DocumentsPath();
+          	NSString* profile = [docs stringByAppendingString:@"profile/"];
+          	[[NSFileManager defaultManager] createDirectoryAtPath:profile withIntermediateDirectories:YES
+          	                                           attributes:nil error:nil];
+
+          	g_argv_storage = [NSMutableArray array];
+          	[g_argv_storage addObject:@"bstone"];
+          	// Game data (the original .BS6 / .VSI ... files) goes next to bstone_ios.ini, i.e. into the
+          	// root of the app's iTunes File Sharing folder.
+          	[g_argv_storage addObject:@"--data_dir"];
+          	[g_argv_storage addObject:docs];
+          	[g_argv_storage addObject:@"--profile_dir"];
+          	[g_argv_storage addObject:profile];
+
+          	NSString* ini = LoadIniText();
+          	NSString* extra = ini ? ReadIniValue(ini, @"args") : nil;
+          	if (extra.length) {
+          		for (NSString* a in [extra componentsSeparatedByCharactersInSet:[NSCharacterSet whitespaceCharacterSet]])
+          			if (a.length) [g_argv_storage addObject:a];
+          	}
+
+          	pthread_attr_t attr;
+          	pthread_attr_init(&attr);
+          	// The default secondary thread stack on iOS is 512 KiB, too small for a DOS-era engine ported
+          	// with large automatic arrays.
+          	pthread_attr_setstacksize(&attr, 8 * 1024 * 1024);
+          	pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
+          	pthread_t th;
+          	if (pthread_create(&th, &attr, GameThreadMain, NULL) != 0) {
+          		g_game_running.store(0);
+          		NSLog(@"BStone: failed to start the game thread");
+          	}
+          	pthread_attr_destroy(&attr);
+          }
+          BSIOS_EOF
+          mkdir -p "$(dirname 'ios/src/app/BSTouchOverlay.h')"
+          cat > 'ios/src/app/BSTouchOverlay.h' <<'BSIOS_EOF'
+          // BSTouchOverlay.h -- on-screen controls. Translates multi-touch input into keyboard / mouse events that
+          // are injected into the game through bsios_event_push_*.
+          #import <UIKit/UIKit.h>
+
+          @interface BSTouchOverlay : UIView
+          // Releases every key that is currently held (call when the app resigns active).
+          - (void)releaseAll;
+          @end
+          BSIOS_EOF
+          mkdir -p "$(dirname 'ios/src/app/BSTouchOverlay.mm')"
+          cat > 'ios/src/app/BSTouchOverlay.mm' <<'BSIOS_EOF'
+          // BSTouchOverlay.mm
+          //
+          // Layout (landscape):
+          //   bottom-left : 8-way virtual stick (up/down = forward/back, left/right = turn) + two strafe buttons
+          //   bottom-right: FIRE (Ctrl), USE (Space), RUN (latch, Shift), previous / next weapon (Q / E)
+          //   top         : MENU (Esc), ENTER, TAB (stats), Y, N, and the weapon keys 1..6
+          //   anywhere else: dragging turns the player (relative mouse motion, X axis)
+          //
+          // Every control is hit-tested by this single view, which owns all touches (multipleTouchEnabled), so
+          // any combination of fingers works without per-button UIControl plumbing.
+          #import "BSTouchOverlay.h"
+          #import "BSHost.h"
+
+          #include <vector>
+          #include "bsios_bridge.h"
+          #include "bstone_sys_keyboard_key.h"
+
+          using bstone::sys::KeyboardKey;
+          static inline int K(KeyboardKey k) { return static_cast<int>(k); }
+
+          namespace {
+
+          enum ControlKind { kButton, kStick, kLook };
+
+          struct Control {
+          	ControlKind kind;
+          	CGPoint center;
+          	CGFloat radius;                 // buttons and stick are round
+          	NSString* label;
+          	std::vector<int> keys;          // KeyboardKey values sent while pressed
+          	BOOL latch;                     // toggles on tap instead of following the finger
+          	BOOL latched;
+          	int pressCount;                 // number of touches holding it (0/1)
+          };
+
+          // Press-count per key so two controls mapping to the same key do not release each other.
+          static int g_key_down_count[256];
+
+          static void KeyDown(int key) {
+          	if (key < 0 || key >= 256) return;
+          	if (g_key_down_count[key]++ == 0) bsios_event_push_key(key, 1);
+          }
+          static void KeyUp(int key) {
+          	if (key < 0 || key >= 256) return;
+          	if (g_key_down_count[key] > 0 && --g_key_down_count[key] == 0) bsios_event_push_key(key, 0);
+          }
+
+          enum StickDir { kDirUp = 1, kDirDown = 2, kDirLeft = 4, kDirRight = 8 };
+
+          }  // namespace
+
+          @implementation BSTouchOverlay {
+          	std::vector<Control> _controls;
+          	NSMutableDictionary* _touchToControl;   // touch pointer -> NSNumber(control index)
+          	NSMutableDictionary* _lookLast;         // touch pointer -> NSValue(CGPoint last)
+          	int _stickIndex;
+          	int _stickDirs;                         // directions currently held by the stick
+          	CGPoint _stickTouch;
+          	CGFloat _unit;
+          	BOOL _grabRequested;
+          }
+
+          - (instancetype)initWithFrame:(CGRect)frame {
+          	if ((self = [super initWithFrame:frame])) {
+          		self.backgroundColor = [UIColor clearColor];
+          		self.opaque = NO;
+          		self.multipleTouchEnabled = YES;
+          		self.exclusiveTouch = NO;
+          		_touchToControl = [NSMutableDictionary dictionary];
+          		_lookLast = [NSMutableDictionary dictionary];
+          		_stickIndex = -1;
+          		[self buildControls];
+          	}
+          	return self;
+          }
+
+          - (void)layoutSubviews {
+          	[super layoutSubviews];
+          	[self releaseAll];
+          	[self buildControls];
+          	[self setNeedsDisplay];
+          }
+
+          // ---------------------------------------------------------------------------
+          - (void)addButton:(NSString*)label x:(CGFloat)x y:(CGFloat)y r:(CGFloat)r keys:(std::vector<int>)keys latch:(BOOL)latch {
+          	Control c = {kButton, CGPointMake(x, y), r, label, keys, latch, NO, 0};
+          	_controls.push_back(c);
+          }
+
+          - (void)buildControls {
+          	_controls.clear();
+          	CGSize sz = self.bounds.size;
+          	CGFloat W = sz.width, H = sz.height;
+          	_unit = MAX(1.0, MIN(H / 320.0, 2.0));
+          	CGFloat u = _unit, m = 14 * u;
+
+          	// Stick.
+          	CGFloat sr = 62 * u;
+          	Control stick = {kStick, CGPointMake(m + sr, H - m - sr), sr, nil, {}, NO, NO, 0};
+          	_stickIndex = (int)_controls.size();
+          	_controls.push_back(stick);
+
+          	// Strafe buttons above the stick.
+          	[self addButton:@"◀" x:m + 20 * u y:H - m - 2 * sr - 24 * u r:20 * u keys:std::vector<int>{K(KeyboardKey::a)} latch:NO];
+          	[self addButton:@"▶" x:m + 2 * sr - 20 * u y:H - m - 2 * sr - 24 * u r:20 * u keys:std::vector<int>{K(KeyboardKey::d)} latch:NO];
+
+          	// Right cluster.
+          	CGFloat fr = 40 * u;
+          	CGFloat fx = W - m - fr, fy = H - m - fr;
+          	[self addButton:@"FIRE" x:fx y:fy r:fr keys:std::vector<int>{K(KeyboardKey::left_ctrl)} latch:NO];
+          	[self addButton:@"USE" x:fx - fr - 32 * u y:fy + 8 * u r:30 * u keys:std::vector<int>{K(KeyboardKey::space)} latch:NO];
+          	[self addButton:@"RUN" x:fx - 6 * u y:fy - fr - 30 * u r:26 * u keys:std::vector<int>{K(KeyboardKey::left_shift)} latch:YES];
+          	[self addButton:@"Q" x:fx - fr - 52 * u y:fy - 40 * u r:22 * u keys:std::vector<int>{K(KeyboardKey::q)} latch:NO];
+          	[self addButton:@"E" x:fx - fr - 4 * u y:fy - 76 * u r:22 * u keys:std::vector<int>{K(KeyboardKey::e)} latch:NO];
+
+          	// Top row: system keys, then weapons.
+          	CGFloat tr = 18 * u, ty = m + tr, tx = m + tr;
+          	NSArray* names = @[@"ESC", @"ENTER", @"TAB", @"Y", @"N"];
+          	int sys[] = {K(KeyboardKey::esc), K(KeyboardKey::enter), K(KeyboardKey::tab), K(KeyboardKey::y), K(KeyboardKey::n)};
+          	for (NSUInteger i = 0; i < names.count; i++) {
+          		[self addButton:names[i] x:tx y:ty r:tr keys:std::vector<int>{sys[i]} latch:NO];
+          		tx += 2 * tr + 6 * u;
+          	}
+          	int nums[] = {K(KeyboardKey::n1), K(KeyboardKey::n2), K(KeyboardKey::n3), K(KeyboardKey::n4), K(KeyboardKey::n5), K(KeyboardKey::n6)};
+          	CGFloat wr = 15 * u;
+          	CGFloat wx = W - m - wr;
+          	for (int i = 5; i >= 0; i--) {
+          		[self addButton:[NSString stringWithFormat:@"%d", i + 1] x:wx y:m + wr r:wr keys:std::vector<int>{nums[i]} latch:NO];
+          		wx -= 2 * wr + 4 * u;
+          	}
+          }
+
+          // ---------------------------------------------------------------------------
+          // Hit testing
+          // ---------------------------------------------------------------------------
+          - (int)controlIndexAt:(CGPoint)p {
+          	// Buttons win over the stick; the stick over the look area.
+          	for (int i = (int)_controls.size() - 1; i >= 0; i--) {
+          		const Control& c = _controls[i];
+          		CGFloat dx = p.x - c.center.x, dy = p.y - c.center.y;
+          		CGFloat r = c.radius + (c.kind == kButton ? 6 * _unit : 0);   // a little slop for thumbs
+          		if (dx * dx + dy * dy <= r * r) return i;
+          	}
+          	return -1;   // look area
+          }
+
+          - (int)stickDirsForPoint:(CGPoint)p {
+          	const Control& s = _controls[_stickIndex];
+          	CGFloat dx = p.x - s.center.x, dy = p.y - s.center.y;
+          	CGFloat dist = sqrt(dx * dx + dy * dy);
+          	if (dist < s.radius * 0.22) return 0;
+          	CGFloat a = atan2(-dy, dx);   // 0 = right, +pi/2 = up
+          	int dirs = 0;
+          	// 8 sectors of 45 degrees; diagonals set two bits.
+          	if (a > M_PI / 8 && a < 7 * M_PI / 8) dirs |= kDirUp;
+          	if (a < -M_PI / 8 && a > -7 * M_PI / 8) dirs |= kDirDown;
+          	if (fabs(a) < 3 * M_PI / 8) dirs |= kDirRight;
+          	if (fabs(a) > 5 * M_PI / 8) dirs |= kDirLeft;
+          	return dirs;
+          }
+
+          - (void)applyStickDirs:(int)dirs {
+          	int changed = dirs ^ _stickDirs;
+          	if (!changed) return;
+          	struct Map { int bit; int k1; int k2; };
+          	// Forward / back are sent as both the arrow and W / S: menus navigate with the arrows, the game
+          	// moves with W / S (the default BStone bindings). Left / right turn in the game and move in menus.
+          	static const Map map[] = {
+          		{kDirUp,    K(KeyboardKey::up),    K(KeyboardKey::w)},
+          		{kDirDown,  K(KeyboardKey::down),  K(KeyboardKey::s)},
+          		{kDirLeft,  K(KeyboardKey::left),  0},
+          		{kDirRight, K(KeyboardKey::right), 0},
+          	};
+          	for (const Map& m : map) {
+          		if (!(changed & m.bit)) continue;
+          		if (dirs & m.bit) { KeyDown(m.k1); if (m.k2) KeyDown(m.k2); }
+          		else              { KeyUp(m.k1);   if (m.k2) KeyUp(m.k2); }
+          	}
+          	_stickDirs = dirs;
+          	[self setNeedsDisplay];
+          }
+
+          // ---------------------------------------------------------------------------
+          // Touches
+          // ---------------------------------------------------------------------------
+          - (NSValue*)keyFor:(UITouch*)t { return [NSValue valueWithPointer:(__bridge const void*)t]; }
+
+          - (void)pressControl:(int)i {
+          	Control& c = _controls[i];
+          	if (c.latch) {
+          		c.latched = !c.latched;
+          		for (int k : c.keys) { if (c.latched) KeyDown(k); else KeyUp(k); }
+          	} else {
+          		if (c.pressCount++ == 0) for (int k : c.keys) KeyDown(k);
+          	}
+          	[self setNeedsDisplay];
+          }
+
+          - (void)releaseControl:(int)i {
+          	Control& c = _controls[i];
+          	if (c.latch) return;
+          	if (c.pressCount > 0 && --c.pressCount == 0) for (int k : c.keys) KeyUp(k);
+          	[self setNeedsDisplay];
+          }
+
+          - (void)touchesBegan:(NSSet*)touches withEvent:(UIEvent*)event {
+          	for (UITouch* t in touches) {
+          		CGPoint p = [t locationInView:self];
+          		int idx = [self controlIndexAt:p];
+          		NSValue* key = [self keyFor:t];
+          		if (idx < 0) {
+          			_touchToControl[key] = @(-1);
+          			_lookLast[key] = [NSValue valueWithCGPoint:p];
+          			if (!bsios_mouse_is_relative()) {
+          				// BStone only reads mouse deltas while the mouse is "grabbed", and the first click grabs it.
+          				bsios_event_push_mouse_button(0, 1, (int)p.x, (int)p.y);
+          				bsios_event_push_mouse_button(0, 0, (int)p.x, (int)p.y);
+          			}
+          		} else if (_controls[idx].kind == kStick) {
+          			_touchToControl[key] = @(idx);
+          			[self applyStickDirs:[self stickDirsForPoint:p]];
+          		} else {
+          			_touchToControl[key] = @(idx);
+          			[self pressControl:idx];
+          		}
+          	}
+          }
+
+          - (void)touchesMoved:(NSSet*)touches withEvent:(UIEvent*)event {
+          	for (UITouch* t in touches) {
+          		NSValue* key = [self keyFor:t];
+          		NSNumber* n = _touchToControl[key];
+          		if (!n) continue;
+          		CGPoint p = [t locationInView:self];
+          		int idx = n.intValue;
+          		if (idx == -1) {
+          			CGPoint last = [_lookLast[key] CGPointValue];
+          			// Horizontal drag turns the player; a swipe across the screen is roughly a half turn.
+          			int dx = (int)lround((p.x - last.x) * 2.0);
+          			if (dx != 0) {
+          				bsios_event_push_mouse_motion((int)p.x, (int)p.y, dx, 0, 0);
+          				_lookLast[key] = [NSValue valueWithCGPoint:p];
+          			}
+          		} else if (_controls[idx].kind == kStick) {
+          			[self applyStickDirs:[self stickDirsForPoint:p]];
+          		}
+          	}
+          }
+
+          - (void)finishTouches:(NSSet*)touches {
+          	for (UITouch* t in touches) {
+          		NSValue* key = [self keyFor:t];
+          		NSNumber* n = _touchToControl[key];
+          		if (!n) continue;
+          		int idx = n.intValue;
+          		if (idx >= 0) {
+          			if (_controls[idx].kind == kStick) [self applyStickDirs:0];
+          			else [self releaseControl:idx];
+          		}
+          		[_touchToControl removeObjectForKey:key];
+          		[_lookLast removeObjectForKey:key];
+          	}
+          }
+
+          - (void)touchesEnded:(NSSet*)touches withEvent:(UIEvent*)event { [self finishTouches:touches]; }
+          - (void)touchesCancelled:(NSSet*)touches withEvent:(UIEvent*)event { [self finishTouches:touches]; }
+
+          - (void)releaseAll {
+          	[self applyStickDirs:0];
+          	for (Control& c : _controls) {
+          		if (c.latch && c.latched) { for (int k : c.keys) KeyUp(k); c.latched = NO; }
+          		while (c.pressCount > 0) { c.pressCount--; if (c.pressCount == 0) for (int k : c.keys) KeyUp(k); }
+          	}
+          	[_touchToControl removeAllObjects];
+          	[_lookLast removeAllObjects];
+          	for (int k = 0; k < 256; k++) {
+          		if (g_key_down_count[k] > 0) { g_key_down_count[k] = 0; bsios_event_push_key(k, 0); }
+          	}
+          	[self setNeedsDisplay];
+          }
+
+          // ---------------------------------------------------------------------------
+          // Drawing
+          // ---------------------------------------------------------------------------
+          - (void)drawRect:(CGRect)rect {
+          	CGContextRef g = UIGraphicsGetCurrentContext();
+          	NSDictionary* attrs = @{
+          		NSFontAttributeName : [UIFont boldSystemFontOfSize:MAX(9.0, 11.0 * _unit)],
+          		NSForegroundColorAttributeName : [UIColor colorWithWhite:1.0 alpha:0.85],
+          	};
+          	for (const Control& c : _controls) {
+          		CGRect r = CGRectMake(c.center.x - c.radius, c.center.y - c.radius, 2 * c.radius, 2 * c.radius);
+          		BOOL on = c.pressCount > 0 || c.latched;
+          		if (c.kind == kStick) {
+          			CGContextSetFillColorWithColor(g, [UIColor colorWithWhite:1 alpha:0.10].CGColor);
+          			CGContextFillEllipseInRect(g, r);
+          			CGContextSetStrokeColorWithColor(g, [UIColor colorWithWhite:1 alpha:0.35].CGColor);
+          			CGContextSetLineWidth(g, 2);
+          			CGContextStrokeEllipseInRect(g, CGRectInset(r, 1, 1));
+          			// Highlight active directions with a dot.
+          			CGFloat dx = 0, dy = 0;
+          			if (_stickDirs & kDirLeft) dx -= 1;
+          			if (_stickDirs & kDirRight) dx += 1;
+          			if (_stickDirs & kDirUp) dy -= 1;
+          			if (_stickDirs & kDirDown) dy += 1;
+          			CGFloat n = sqrt(dx * dx + dy * dy);
+          			if (n > 0) { dx /= n; dy /= n; }
+          			CGFloat kr = c.radius * 0.30;
+          			CGPoint kc = CGPointMake(c.center.x + dx * c.radius * 0.55, c.center.y + dy * c.radius * 0.55);
+          			CGContextSetFillColorWithColor(g, [UIColor colorWithWhite:1 alpha:(n > 0 ? 0.55 : 0.25)].CGColor);
+          			CGContextFillEllipseInRect(g, CGRectMake(kc.x - kr, kc.y - kr, 2 * kr, 2 * kr));
+          			continue;
+          		}
+          		CGContextSetFillColorWithColor(g, [UIColor colorWithWhite:(on ? 1.0 : 0.0) alpha:(on ? 0.45 : 0.28)].CGColor);
+          		CGContextFillEllipseInRect(g, r);
+          		CGContextSetStrokeColorWithColor(g, [UIColor colorWithWhite:1 alpha:0.45].CGColor);
+          		CGContextSetLineWidth(g, 1.5);
+          		CGContextStrokeEllipseInRect(g, CGRectInset(r, 1, 1));
+          		CGSize ts = [c.label sizeWithAttributes:attrs];
+          		[c.label drawAtPoint:CGPointMake(c.center.x - ts.width / 2, c.center.y - ts.height / 2) withAttributes:attrs];
+          	}
+          }
+
+          @end
+          BSIOS_EOF
+          mkdir -p "$(dirname 'ios/src/app/main.mm')"
+          cat > 'ios/src/app/main.mm' <<'BSIOS_EOF'
+          #import <UIKit/UIKit.h>
+          #import "BSAppDelegate.h"
+
+          int main(int argc, char* argv[]) {
+          	@autoreleasepool {
+          		return UIApplicationMain(argc, argv, nil, NSStringFromClass([BSAppDelegate class]));
+          	}
+          }
+          BSIOS_EOF
+          mkdir -p "$(dirname 'ios/src/bsios_bridge.h')"
+          cat > 'ios/src/bsios_bridge.h' <<'BSIOS_EOF'
+          /*
+          BStone iOS port.
+          SPDX-License-Identifier: GPL-2.0-or-later
+
+          Plain C bridge between the portable C++ "sys" layer (ios/src/sys, which implements
+          bstone::sys on top of this header) and the Objective-C++ application layer (ios/src/app),
+          which owns UIKit / EAGL / AudioQueue.
+
+          Rules (they come from hard lessons of the zelda3 iOS port, see README_IOS.md):
+            * Everything declared here is called from the GAME thread, never from the main thread.
+            * No function here may dispatch_sync() to the main thread (a blocked main thread plus a
+              blocked game thread is the classic deadlock of the earlier SDL-based port).
+            * The functions in the "event injection" section are the opposite direction: they are
+              implemented by the C++ layer and are called from the UI thread (any thread, they are locked).
+          */
+          #ifndef BSIOS_BRIDGE_H_
+          #define BSIOS_BRIDGE_H_
+
+          #include <stddef.h>
+
+          #ifdef __cplusplus
+          extern "C" {
+          #endif
+
+          /* ------------------------------------------------------------------------ */
+          /* Screen / window                                                          */
+          /* ------------------------------------------------------------------------ */
+
+          /* Native (landscape) size of the drawable in pixels after applying the configured render scale. */
+          void bsios_screen_get_size(int* width, int* height);
+          int bsios_screen_get_refresh_rate(void);
+
+          /* ------------------------------------------------------------------------ */
+          /* OpenGL ES 2.0                                                            */
+          /* ------------------------------------------------------------------------ */
+
+          /*
+          Creates an EAGLContext (ES2), a framebuffer with a color renderbuffer bound to the game view's
+          CAEAGLLayer and (if depth_bits > 0) a depth renderbuffer, and makes the context current on
+          the calling thread. Returns 0 on success, nonzero on failure.
+          If a context exists it is destroyed first.
+          */
+          int bsios_gl_create(int depth_bits);
+          void bsios_gl_destroy(void);
+          void bsios_gl_get_drawable_size(int* width, int* height);
+
+          /*
+          Presents the color renderbuffer. While the application is not active (backgrounded / interrupted)
+          this call parks the calling thread, because iOS kills applications that touch OpenGL in background.
+          */
+          void bsios_gl_swap(void);
+
+          /* Name of the framebuffer object that stands in for the "default framebuffer" (iOS has none). */
+          unsigned int bsios_gl_get_default_framebuffer(void);
+
+          /* ------------------------------------------------------------------------ */
+          /* Files                                                                    */
+          /* ------------------------------------------------------------------------ */
+
+          /* Writes a NUL-terminated path (with trailing '/') into buffer. Returns its length or -1. */
+          int bsios_get_documents_path(char* buffer, size_t buffer_size);
+
+          /* ------------------------------------------------------------------------ */
+          /* Message box                                                              */
+          /* ------------------------------------------------------------------------ */
+
+          /*
+          Shows a UIAlertView (UIAlertController needs iOS 8) and blocks the calling (game) thread until
+          a button is pressed. Returns the index of the pressed button, or -1 on failure.
+          button_titles: array of button_count titles, [0] is the default.
+          */
+          int bsios_message_box(const char* title, const char* message, const char* const* button_titles, int button_count);
+
+          /* ------------------------------------------------------------------------ */
+          /* Audio                                                                    */
+          /* ------------------------------------------------------------------------ */
+
+          /* Called on the audio thread; fills `sample_count` interleaved float samples (frames * channels). */
+          typedef void (*bsios_audio_callback)(void* user_data, float* samples, int sample_count);
+
+          /*
+          Opens an AudioQueue output (32-bit float PCM). On success returns 0 and writes the effective
+          parameters. The queue starts paused; call bsios_audio_pause(0).
+          */
+          int bsios_audio_open(
+          	int desired_rate,
+          	int channel_count,
+          	int desired_frame_count,
+          	bsios_audio_callback callback,
+          	void* user_data,
+          	int* effective_rate,
+          	int* effective_frame_count);
+          void bsios_audio_pause(int is_paused);
+          void bsios_audio_close(void);
+
+          /* ------------------------------------------------------------------------ */
+          /* Lifetime                                                                 */
+          /* ------------------------------------------------------------------------ */
+
+          /* Game thread finished (return code of the game's main()). The app terminates the process. */
+          void bsios_game_finished(int exit_code);
+
+          /* ------------------------------------------------------------------------ */
+          /* Event injection: implemented by the C++ layer, called by the UI layer.   */
+          /* `key` is the integer value of bstone::sys::KeyboardKey.                  */
+          /* ------------------------------------------------------------------------ */
+
+          void bsios_event_push_key(int key, int is_pressed);
+          void bsios_event_push_mouse_motion(int x, int y, int delta_x, int delta_y, unsigned int button_mask);
+          void bsios_event_push_mouse_button(int button_index, int is_pressed, int x, int y);
+          void bsios_event_push_focus(int is_gained);
+          void bsios_event_push_quit(void);
+
+          /* Whether the game currently wants relative mouse mode (in-game look/turn). */
+          int bsios_mouse_is_relative(void);
+
+          /* ------------------------------------------------------------------------ */
+          /* Game entry                                                               */
+          /* ------------------------------------------------------------------------ */
+
+          /* Renamed main() of the game (3d_main.cpp). Runs on the game thread. */
+          int bstone_game_main(int argc, char* argv[]);
+
+          #ifdef __cplusplus
+          }
+          #endif
+
+          #endif /* BSIOS_BRIDGE_H_ */
+          BSIOS_EOF
+          mkdir -p "$(dirname 'ios/src/sys/bstone_sys_audio_mgr_ios.cpp')"
+          cat > 'ios/src/sys/bstone_sys_audio_mgr_ios.cpp' <<'BSIOS_EOF'
+          /*
+          BStone iOS port: audio manager + polling audio device on top of AudioQueue (see app/BSAudio.mm).
+          SPDX-License-Identifier: MIT
+          */
+
+          #include <cstring>
+          #include <memory>
+
+          #include "bstone_exception.h"
+          #include "bstone_sys_audio_mgr.h"
+          #include "bstone_sys_polling_audio_device.h"
+
+          #include "bstone_sys_ios.h"
+          #include "bsios_bridge.h"
+
+          namespace bstone {
+          namespace sys {
+
+          namespace {
+
+          class IosPollingAudioDevice final : public PollingAudioDevice
+          {
+          public:
+          	IosPollingAudioDevice(Logger& logger, const PollingAudioDeviceOpenParam& param)
+          	try
+          		:
+          		logger_{logger}
+          	{
+          		logger_.log_information("<<< Start up iOS polling audio device.");
+
+          		if (param.channel_count <= 0 || param.channel_count > 2)
+          		{
+          			BSTONE_THROW_STATIC_SOURCE("Channel count out of range.");
+          		}
+
+          		if (param.desired_frame_count <= 0 || param.desired_frame_count > 65535)
+          		{
+          			BSTONE_THROW_STATIC_SOURCE("Frame count out of range.");
+          		}
+
+          		if (param.callback == nullptr)
+          		{
+          			BSTONE_THROW_STATIC_SOURCE("Null callback.");
+          		}
+
+          		callback_ = param.callback;
+          		channel_count_ = param.channel_count;
+
+          		const auto result = bsios_audio_open(
+          			param.desired_rate,
+          			param.channel_count,
+          			param.desired_frame_count,
+          			&IosPollingAudioDevice::audio_callback,
+          			this,
+          			&rate_,
+          			&frame_count_);
+
+          		if (result != 0)
+          		{
+          			BSTONE_THROW_STATIC_SOURCE("Failed to open an audio queue.");
+          		}
+
+          		is_open_ = true;
+          		logger_.log_information(">>> iOS polling audio device started up.");
+          	} BSTONE_END_FUNC_CATCH_ALL_THROW_NESTED
+
+          	IosPollingAudioDevice(const IosPollingAudioDevice&) = delete;
+          	IosPollingAudioDevice& operator=(const IosPollingAudioDevice&) = delete;
+
+          	~IosPollingAudioDevice() override
+          	{
+          		logger_.log_information("Shut down iOS polling audio device.");
+
+          		if (is_open_)
+          		{
+          			bsios_audio_close();
+          		}
+          	}
+
+          private:
+          	Logger& logger_;
+          	PollingAudioDeviceCallback* callback_{};
+          	int rate_{};
+          	int channel_count_{};
+          	int frame_count_{};
+          	bool is_open_{};
+
+          private:
+          	int do_get_rate() const noexcept override { return rate_; }
+          	int do_get_channel_count() const noexcept override { return channel_count_; }
+          	int do_get_frame_count() const noexcept override { return frame_count_; }
+
+          	void do_pause(bool is_pause) override
+          	{
+          		bsios_audio_pause(is_pause ? 1 : 0);
+          	}
+
+          private:
+          	// Runs on the AudioQueue thread. Never lets an exception escape into C / Objective-C frames.
+          	static void audio_callback(void* user_data, float* samples, int sample_count)
+          	{
+          		auto& self = *static_cast<IosPollingAudioDevice*>(user_data);
+
+          		try
+          		{
+          			self.callback_->invoke(samples, sample_count);
+          		}
+          		catch (...)
+          		{
+          			std::memset(samples, 0, static_cast<std::size_t>(sample_count) * sizeof(float));
+          		}
+          	}
+          };
+
+          // ==========================================================================
+
+          class IosAudioMgr final : public AudioMgr
+          {
+          public:
+          	explicit IosAudioMgr(Logger& logger)
+          		:
+          		logger_{logger}
+          	{
+          		logger_.log_information("Start up iOS audio manager.");
+          	}
+
+          	~IosAudioMgr() override
+          	{
+          		logger_.log_information("Shut down iOS audio manager.");
+          	}
+
+          private:
+          	Logger& logger_;
+
+          private:
+          	bool do_is_initialized() const noexcept override
+          	{
+          		return true;
+          	}
+
+          	PollingAudioDeviceUPtr do_make_polling_audio_device(const PollingAudioDeviceOpenParam& param) override
+          	{
+          		return std::make_unique<IosPollingAudioDevice>(logger_, param);
+          	}
+          };
+
+          } // namespace
+
+          // ==========================================================================
+
+          AudioMgrUPtr make_ios_audio_mgr(Logger& logger)
+          try {
+          	return std::make_unique<IosAudioMgr>(logger);
+          } BSTONE_END_FUNC_CATCH_ALL_THROW_NESTED
+
+          } // namespace sys
+          } // namespace bstone
+          BSIOS_EOF
+          mkdir -p "$(dirname 'ios/src/sys/bstone_sys_event_mgr_ios.cpp')"
+          cat > 'ios/src/sys/bstone_sys_event_mgr_ios.cpp' <<'BSIOS_EOF'
+          /*
+          BStone iOS port: event manager.
+
+          The UI layer (UIKit main thread) injects keyboard / mouse / focus / quit events through the
+          bsios_event_push_* functions; the game thread drains them with EventMgr::poll_event().
+          SPDX-License-Identifier: MIT
+          */
+
+          #include <atomic>
+          #include <chrono>
+          #include <deque>
+          #include <mutex>
+
+          #include "bstone_exception.h"
+          #include "bstone_sys_event.h"
+          #include "bstone_sys_event_mgr.h"
+          #include "bstone_sys_keyboard_key.h"
+          #include "bstone_sys_mouse.h"
+
+          #include "bstone_sys_ios.h"
+          #include "bsios_bridge.h"
+
+          namespace bstone {
+          namespace sys {
+
+          namespace {
+
+          constexpr auto max_queued_events = std::size_t{4096};
+          constexpr auto ios_window_id = 1U;
+
+          struct EventQueue
+          {
+          	std::mutex mutex;
+          	std::deque<Event> events;
+          	std::atomic<bool> is_relative_mouse{false};
+          	unsigned int mouse_button_mask{};
+          };
+
+          EventQueue& get_queue()
+          {
+          	static EventQueue queue;
+          	return queue;
+          }
+
+          unsigned int get_timestamp_ms()
+          {
+          	using namespace std::chrono;
+          	return static_cast<unsigned int>(
+          		duration_cast<milliseconds>(steady_clock::now().time_since_epoch()).count());
+          }
+
+          void push_event(const Event& e)
+          {
+          	auto& q = get_queue();
+          	const std::lock_guard<std::mutex> lock{q.mutex};
+
+          	if (q.events.size() >= max_queued_events)
+          	{
+          		q.events.pop_front();
+          	}
+
+          	q.events.push_back(e);
+          }
+
+          // ==========================================================================
+
+          class IosEventMgr final : public EventMgr
+          {
+          public:
+          	IosEventMgr(Logger& logger)
+          		:
+          		logger_{logger}
+          	{
+          		logger_.log_information("Start up iOS event manager.");
+          		auto& q = get_queue();
+          		const std::lock_guard<std::mutex> lock{q.mutex};
+          		q.events.clear();
+          	}
+
+          	~IosEventMgr() override
+          	{
+          		logger_.log_information("Shut down iOS event manager.");
+          	}
+
+          private:
+          	Logger& logger_;
+
+          private:
+          	bool do_is_initialized() const noexcept override
+          	{
+          		return true;
+          	}
+
+          	bool do_poll_event(Event& e) override
+          	{
+          		auto& q = get_queue();
+          		const std::lock_guard<std::mutex> lock{q.mutex};
+
+          		if (q.events.empty())
+          		{
+          			return false;
+          		}
+
+          		e = q.events.front();
+          		q.events.pop_front();
+          		return true;
+          	}
+          };
+
+          } // namespace
+
+          // ==========================================================================
+
+          EventMgrUPtr make_ios_event_mgr(Logger& logger)
+          try {
+          	return std::make_unique<IosEventMgr>(logger);
+          } BSTONE_END_FUNC_CATCH_ALL_THROW_NESTED
+
+          void ios_set_relative_mouse(bool is_relative)
+          {
+          	get_queue().is_relative_mouse.store(is_relative);
+          }
+
+          } // namespace sys
+          } // namespace bstone
+
+          // ==========================================================================
+          // C bridge (called from the UI thread).
+          // ==========================================================================
+
+          extern "C" {
+
+          void bsios_event_push_key(int key, int is_pressed)
+          {
+          	using namespace bstone::sys;
+
+          	auto e = Event{};
+          	e.keyboard.type = EventType::keyboard;
+          	e.keyboard.timestamp = get_timestamp_ms();
+          	e.keyboard.is_pressed = (is_pressed != 0);
+          	e.keyboard.key = static_cast<KeyboardKey>(key);
+          	e.keyboard.repeat_count = 0;
+          	e.keyboard.window_id = ios_window_id;
+          	push_event(e);
+          }
+
+          void bsios_event_push_mouse_motion(int x, int y, int delta_x, int delta_y, unsigned int button_mask)
+          {
+          	using namespace bstone::sys;
+
+          	auto& q = get_queue();
+          	const std::lock_guard<std::mutex> lock{q.mutex};
+
+          	// Coalesce with the previous motion event: touch move events are far more frequent than frames.
+          	if (!q.events.empty() && q.events.back().common.type == EventType::mouse_motion)
+          	{
+          		auto& m = q.events.back().mouse_motion;
+          		m.x = x;
+          		m.y = y;
+          		m.delta_x += delta_x;
+          		m.delta_y += delta_y;
+          		m.button_mask = button_mask;
+          		return;
+          	}
+
+          	if (q.events.size() >= max_queued_events)
+          	{
+          		q.events.pop_front();
+          	}
+
+          	auto e = Event{};
+          	e.mouse_motion.type = EventType::mouse_motion;
+          	e.mouse_motion.timestamp = get_timestamp_ms();
+          	e.mouse_motion.x = x;
+          	e.mouse_motion.y = y;
+          	e.mouse_motion.delta_x = delta_x;
+          	e.mouse_motion.delta_y = delta_y;
+          	e.mouse_motion.button_mask = button_mask;
+          	e.mouse_motion.window_id = ios_window_id;
+          	q.events.push_back(e);
+          }
+
+          void bsios_event_push_mouse_button(int button_index, int is_pressed, int x, int y)
+          {
+          	using namespace bstone::sys;
+
+          	auto e = Event{};
+          	e.mouse_button.type = EventType::mouse_button;
+          	e.mouse_button.timestamp = get_timestamp_ms();
+          	e.mouse_button.is_pressed = (is_pressed != 0);
+          	e.mouse_button.x = x;
+          	e.mouse_button.y = y;
+          	e.mouse_button.button_index = button_index;
+          	e.mouse_button.click_count = 1;
+          	e.mouse_button.window_id = ios_window_id;
+          	push_event(e);
+          }
+
+          void bsios_event_push_focus(int is_gained)
+          {
+          	using namespace bstone::sys;
+
+          	auto e = Event{};
+          	e.window.type = EventType::window;
+          	e.window.timestamp = get_timestamp_ms();
+          	e.window.event_type =
+          		is_gained != 0 ? WindowEventType::keyboard_focus_gained : WindowEventType::keyboard_focus_lost;
+          	e.window.id = ios_window_id;
+          	push_event(e);
+          }
+
+          void bsios_event_push_quit(void)
+          {
+          	using namespace bstone::sys;
+
+          	auto e = Event{};
+          	e.common.type = EventType::quit;
+          	e.common.timestamp = get_timestamp_ms();
+          	push_event(e);
+          }
+
+          int bsios_mouse_is_relative(void)
+          {
+          	return bstone::sys::get_queue().is_relative_mouse.load() ? 1 : 0;
+          }
+
+          } // extern "C"
+          BSIOS_EOF
+          mkdir -p "$(dirname 'ios/src/sys/bstone_sys_ios.h')"
+          cat > 'ios/src/sys/bstone_sys_ios.h' <<'BSIOS_EOF'
+          /*
+          BStone iOS port: factories of the iOS implementation of the bstone::sys layer.
+          SPDX-License-Identifier: MIT
+          */
+
+          #ifndef BSTONE_SYS_IOS_INCLUDED
+          #define BSTONE_SYS_IOS_INCLUDED
+
+          #include "bstone_sys_audio_mgr.h"
+          #include "bstone_sys_event_mgr.h"
+          #include "bstone_sys_logger.h"
+          #include "bstone_sys_video_mgr.h"
+
+          namespace bstone {
+          namespace sys {
+
+          EventMgrUPtr make_ios_event_mgr(Logger& logger);
+          AudioMgrUPtr make_ios_audio_mgr(Logger& logger);
+          VideoMgrUPtr make_ios_video_mgr(Logger& logger);
+
+          // Records whether the game wants relative mouse mode (read by the UI layer through bsios_mouse_is_relative()).
+          void ios_set_relative_mouse(bool is_relative);
+
+          // Window and GL context live in bstone_sys_window_ios.cpp.
+          WindowMgrUPtr make_ios_window_mgr(Logger& logger);
+
+          } // namespace sys
+          } // namespace bstone
+
+          #endif // BSTONE_SYS_IOS_INCLUDED
+          BSIOS_EOF
+          mkdir -p "$(dirname 'ios/src/sys/bstone_sys_misc_ios.cpp')"
+          cat > 'ios/src/sys/bstone_sys_misc_ios.cpp' <<'BSIOS_EOF'
+          /*
+          BStone iOS port: message box, special paths and process utils
+          (replace bstone_sys_message_box_sdl2.cpp, bstone_sys_special_path_sdl2.cpp, bstone_process_posix.cpp).
+          SPDX-License-Identifier: MIT
+          */
+
+          #include <algorithm>
+          #include <cstring>
+          #include <vector>
+
+          #include "bstone_exception.h"
+          #include "bstone_process.h"
+          #include "bstone_sys_message_box.h"
+          #include "bstone_sys_special_path.h"
+
+          #include "bsios_bridge.h"
+
+          namespace bstone {
+          namespace sys {
+
+          // ==========================================================================
+          // Message box
+          // ==========================================================================
+
+          void MessageBox::show_simple(const char* title, const char* message, MessageBoxType)
+          {
+          	const char* const buttons[] = {"OK"};
+          	bsios_message_box(title != nullptr ? title : "", message != nullptr ? message : "", buttons, 1);
+          }
+
+          int MessageBox::show(const MessageBoxInitParam& param)
+          {
+          	const auto button_count = static_cast<int>(param.buttons.get_size());
+
+          	if (button_count <= 0)
+          	{
+          		BSTONE_THROW_STATIC_SOURCE("No buttons.");
+          	}
+
+          	auto titles = std::vector<const char*>{};
+          	titles.reserve(static_cast<std::size_t>(button_count));
+
+          	for (auto i = 0; i < button_count; ++i)
+          	{
+          		titles.push_back(param.buttons[i].text != nullptr ? param.buttons[i].text : "");
+          	}
+
+          	const auto index = bsios_message_box(
+          		param.title != nullptr ? param.title : "",
+          		param.message != nullptr ? param.message : "",
+          		titles.data(),
+          		button_count);
+
+          	if (index < 0 || index >= button_count)
+          	{
+          		return param.buttons[0].id;
+          	}
+
+          	return param.buttons[index].id;
+          }
+
+          // ==========================================================================
+          // Special path
+          // ==========================================================================
+
+          // The "user specific data path" is the app's Documents directory, which iTunes File Sharing exposes.
+          // The organization / application names are not used: the sandbox is already per-application.
+          std::intptr_t SpecialPath::get_user_specific_data_path(
+          	const char*,
+          	const char*,
+          	char* buffer,
+          	std::intptr_t buffer_size)
+          {
+          	if (buffer == nullptr || buffer_size <= 0)
+          	{
+          		BSTONE_THROW_STATIC_SOURCE("Invalid buffer.");
+          	}
+
+          	const auto size = bsios_get_documents_path(buffer, static_cast<std::size_t>(buffer_size));
+
+          	if (size < 0)
+          	{
+          		BSTONE_THROW_STATIC_SOURCE("Failed to get the documents path (or buffer too small).");
+          	}
+
+          	return size;
+          }
+
+          } // namespace sys
+
+          // ==========================================================================
+          // Process: fork() / exec*() are prohibited on iOS, so these are intentionally inert.
+          // ==========================================================================
+
+          namespace process {
+
+          CreateAndWaitForExitResult create_and_wait_for_exit(const CreateAndWaitForExitParam&)
+          {
+          	BSTONE_THROW_STATIC_SOURCE("Starting processes is not supported on iOS.");
+          }
+
+          void open_file_or_url(const char*)
+          {
+          	// Nothing to open with: the "View log" button of the error dialog is a no-op on iOS.
+          }
+
+          } // namespace process
+          } // namespace bstone
+          BSIOS_EOF
+          mkdir -p "$(dirname 'ios/src/sys/bstone_sys_system_mgr_ios.cpp')"
+          cat > 'ios/src/sys/bstone_sys_system_mgr_ios.cpp' <<'BSIOS_EOF'
+          /*
+          BStone iOS port: system manager (replaces bstone_sys_system_mgr_sdl2.cpp).
+          SPDX-License-Identifier: MIT
+          */
+
+          #include <memory>
+
+          #include "bstone_exception.h"
+          #include "bstone_sys_system_mgr.h"
+
+          #include "bstone_sys_ios.h"
+
+          namespace bstone {
+          namespace sys {
+
+          namespace {
+
+          class IosSystemMgr final : public SystemMgr
+          {
+          public:
+          	explicit IosSystemMgr(Logger& logger)
+          	try
+          		:
+          		logger_{logger}
+          	{
+          		logger_.log_information("<<< Start up iOS system manager.");
+          		audio_mgr_ = make_ios_audio_mgr(logger_);
+          		event_mgr_ = make_ios_event_mgr(logger_);
+          		video_mgr_ = make_ios_video_mgr(logger_);
+          		logger_.log_information(">>> iOS system manager started up.");
+          	} BSTONE_END_FUNC_CATCH_ALL_THROW_NESTED
+
+          	IosSystemMgr(const IosSystemMgr&) = delete;
+          	IosSystemMgr& operator=(const IosSystemMgr&) = delete;
+
+          	~IosSystemMgr() override
+          	{
+          		logger_.log_information("Shut down iOS system manager.");
+          		video_mgr_ = nullptr;
+          		event_mgr_ = nullptr;
+          		audio_mgr_ = nullptr;
+          	}
+
+          private:
+          	Logger& logger_;
+          	AudioMgrUPtr audio_mgr_{};
+          	EventMgrUPtr event_mgr_{};
+          	VideoMgrUPtr video_mgr_{};
+
+          private:
+          	Logger& do_get_logger() override { return logger_; }
+          	AudioMgr& do_get_audio_mgr() override { return *audio_mgr_; }
+          	EventMgr& do_get_event_mgr() override { return *event_mgr_; }
+          	VideoMgr& do_get_video_mgr() override { return *video_mgr_; }
+          };
+
+          } // namespace
+
+          // ==========================================================================
+
+          SystemMgrUPtr make_system_mgr(Logger& logger)
+          try {
+          	return std::make_unique<IosSystemMgr>(logger);
+          } BSTONE_END_FUNC_CATCH_ALL_THROW_NESTED
+
+          } // namespace sys
+          } // namespace bstone
+          BSIOS_EOF
+          mkdir -p "$(dirname 'ios/src/sys/bstone_sys_video_mgr_ios.cpp')"
+          cat > 'ios/src/sys/bstone_sys_video_mgr_ios.cpp' <<'BSIOS_EOF'
+          /*
+          BStone iOS port: video manager, mouse manager, Vulkan manager (unavailable), GL current context
+          and GL symbol resolver (replace the corresponding *_sdl2.cpp files).
+
+          iOS has no "default framebuffer": rendering must go to an FBO whose color renderbuffer is bound to
+          the CAEAGLLayer. The BStone GL renderer, however, binds framebuffer 0 whenever it wants the window
+          back buffer. The symbol resolver therefore returns thin wrappers for glBindFramebuffer* that turn
+          name 0 into the FBO created by bsios_gl_create().
+          SPDX-License-Identifier: MIT
+          */
+
+          #include <cstring>
+          #include <memory>
+          #include <string>
+
+          #include <dlfcn.h>
+
+          #include "bstone_exception.h"
+          #include "bstone_span.h"
+          #include "bstone_sys_display_mode.h"
+          #include "bstone_sys_gl_current_context.h"
+          #include "bstone_sys_gl_symbol_resolver.h"
+          #include "bstone_sys_mouse_mgr.h"
+          #include "bstone_sys_video_mgr.h"
+          #include "bstone_sys_vulkan_mgr.h"
+
+          #include "bstone_sys_ios.h"
+          #include "bsios_bridge.h"
+
+          namespace bstone {
+          namespace sys {
+
+          namespace {
+
+          // ==========================================================================
+          // GL symbol resolver
+          // ==========================================================================
+
+          using GlBindFramebufferFunc = void (*)(unsigned int target, unsigned int framebuffer);
+
+          GlBindFramebufferFunc g_real_bind_framebuffer = nullptr;
+          GlBindFramebufferFunc g_real_bind_framebuffer_ext = nullptr;
+          GlBindFramebufferFunc g_real_bind_framebuffer_oes = nullptr;
+
+          unsigned int map_framebuffer_name(unsigned int name)
+          {
+          	return name != 0 ? name : bsios_gl_get_default_framebuffer();
+          }
+
+          void ios_wrap_glBindFramebuffer(unsigned int target, unsigned int framebuffer)
+          {
+          	g_real_bind_framebuffer(target, map_framebuffer_name(framebuffer));
+          }
+
+          void ios_wrap_glBindFramebufferEXT(unsigned int target, unsigned int framebuffer)
+          {
+          	g_real_bind_framebuffer_ext(target, map_framebuffer_name(framebuffer));
+          }
+
+          void ios_wrap_glBindFramebufferOES(unsigned int target, unsigned int framebuffer)
+          {
+          	g_real_bind_framebuffer_oes(target, map_framebuffer_name(framebuffer));
+          }
+
+          class IosGlSymbolResolver final : public GlSymbolResolver
+          {
+          private:
+          	void* do_find_symbol(const char* symbol_name) const noexcept override
+          	{
+          		if (symbol_name == nullptr)
+          		{
+          			return nullptr;
+          		}
+
+          		// RTLD_DEFAULT: the OpenGLES framework is linked into the executable.
+          		void* const symbol = dlsym(RTLD_DEFAULT, symbol_name);
+
+          		if (symbol == nullptr)
+          		{
+          			return nullptr;
+          		}
+
+          		if (std::strcmp(symbol_name, "glBindFramebuffer") == 0)
+          		{
+          			g_real_bind_framebuffer = reinterpret_cast<GlBindFramebufferFunc>(symbol);
+          			return reinterpret_cast<void*>(&ios_wrap_glBindFramebuffer);
+          		}
+
+          		if (std::strcmp(symbol_name, "glBindFramebufferEXT") == 0)
+          		{
+          			g_real_bind_framebuffer_ext = reinterpret_cast<GlBindFramebufferFunc>(symbol);
+          			return reinterpret_cast<void*>(&ios_wrap_glBindFramebufferEXT);
+          		}
+
+          		if (std::strcmp(symbol_name, "glBindFramebufferOES") == 0)
+          		{
+          			g_real_bind_framebuffer_oes = reinterpret_cast<GlBindFramebufferFunc>(symbol);
+          			return reinterpret_cast<void*>(&ios_wrap_glBindFramebufferOES);
+          		}
+
+          		return symbol;
+          	}
+          };
+
+          // ==========================================================================
+          // GL current context
+          // ==========================================================================
+
+          class IosGlCurrentContext final : public GlCurrentContext
+          {
+          public:
+          	explicit IosGlCurrentContext(Logger& logger)
+          		:
+          		logger_{logger}
+          	{
+          		logger_.log_information("Start up OpenGL ES current context.");
+          	}
+
+          	~IosGlCurrentContext() override
+          	{
+          		logger_.log_information("Shut down OpenGL ES current context.");
+          	}
+
+          private:
+          	Logger& logger_;
+          	IosGlSymbolResolver symbol_resolver_{};
+
+          private:
+          	bool do_has_extension(const char* extension_name) const noexcept override
+          	{
+          		using GlGetStringFunc = const unsigned char* (*)(unsigned int name);
+          		constexpr auto gl_extensions = 0x1F03U;
+
+          		if (extension_name == nullptr || extension_name[0] == '\0')
+          		{
+          			return false;
+          		}
+
+          		const auto gl_get_string = symbol_resolver_.find_symbol<GlGetStringFunc>("glGetString");
+
+          		if (gl_get_string == nullptr)
+          		{
+          			return false;
+          		}
+
+          		const auto extensions_chars = gl_get_string(gl_extensions);
+
+          		if (extensions_chars == nullptr)
+          		{
+          			return false;
+          		}
+
+          		const auto extensions = std::string{" "} + reinterpret_cast<const char*>(extensions_chars) + " ";
+          		const auto needle = std::string{" "} + extension_name + " ";
+          		return extensions.find(needle) != std::string::npos;
+          	}
+
+          	// The display link of iOS always presents in sync with the display: the swap interval is
+          	// fixed to "standard" and cannot be changed.
+          	SwapIntervalType do_get_swap_interval() const noexcept override
+          	{
+          		return SwapIntervalType::standard;
+          	}
+
+          	void do_set_swap_interval(SwapIntervalType swap_interval_type) override
+          	{
+          		switch (swap_interval_type)
+          		{
+          			case SwapIntervalType::none:
+          			case SwapIntervalType::standard:
+          				break;
+
+          			default:
+          				BSTONE_THROW_STATIC_SOURCE("Unsupported swap interval type.");
+          		}
+          	}
+
+          	const GlSymbolResolver& do_get_symbol_resolver() const noexcept override
+          	{
+          		return symbol_resolver_;
+          	}
+          };
+
+          // ==========================================================================
+          // Mouse manager: touches are translated to mouse events by the UI layer.
+          // ==========================================================================
+
+          class IosMouseMgr final : public MouseMgr
+          {
+          private:
+          	void do_set_relative_mode(bool is_relative) override
+          	{
+          		ios_set_relative_mouse(is_relative);
+          	}
+          };
+
+          // ==========================================================================
+          // Vulkan manager: Vulkan does not exist on iOS 7.
+          // ==========================================================================
+
+          class IosVulkanMgr final : public VulkanMgr
+          {
+          private:
+          	bool do_is_vulkan_available() const override
+          	{
+          		return false;
+          	}
+
+          	void* do_get_instance_proc_addr() const override
+          	{
+          		BSTONE_THROW_STATIC_SOURCE("Vulkan is not available on iOS.");
+          	}
+
+          	Span<const char*> do_get_required_extensions(Window&) override
+          	{
+          		BSTONE_THROW_STATIC_SOURCE("Vulkan is not available on iOS.");
+          	}
+
+          	VkSurfaceKHR do_create_surface(Window&, VkInstance) override
+          	{
+          		BSTONE_THROW_STATIC_SOURCE("Vulkan is not available on iOS.");
+          	}
+          };
+
+          // ==========================================================================
+          // Video manager
+          // ==========================================================================
+
+          class IosVideoMgr final : public VideoMgr
+          {
+          public:
+          	explicit IosVideoMgr(Logger& logger)
+          	try
+          		:
+          		logger_{logger}
+          	{
+          		logger_.log_information("<<< Start up iOS video manager.");
+
+          		display_mode_ = query_display_mode();
+          		logger_.log_information(
+          			("Display: " +
+          				std::to_string(display_mode_.width) + "x" + std::to_string(display_mode_.height) +
+          				" @ " + std::to_string(display_mode_.refresh_rate) + " Hz").c_str());
+
+          		mouse_mgr_ = std::make_unique<IosMouseMgr>();
+          		window_mgr_ = make_ios_window_mgr(logger_);
+          		gl_current_context_ = std::make_unique<IosGlCurrentContext>(logger_);
+          		vulkan_mgr_ = std::make_unique<IosVulkanMgr>();
+          		is_initialized_ = true;
+
+          		logger_.log_information(">>> iOS video manager started up.");
+          	} BSTONE_END_FUNC_CATCH_ALL_THROW_NESTED
+
+          	~IosVideoMgr() override
+          	{
+          		logger_.log_information("Shut down iOS video manager.");
+          	}
+
+          private:
+          	Logger& logger_;
+          	bool is_initialized_{};
+          	DisplayMode display_mode_{};
+          	MouseMgrUPtr mouse_mgr_{};
+          	WindowMgrUPtr window_mgr_{};
+          	GlCurrentContextUPtr gl_current_context_{};
+          	VulkanMgrUPtr vulkan_mgr_{};
+
+          private:
+          	static DisplayMode query_display_mode()
+          	{
+          		auto mode = DisplayMode{};
+          		bsios_screen_get_size(&mode.width, &mode.height);
+          		mode.refresh_rate = bsios_screen_get_refresh_rate();
+          		return mode;
+          	}
+
+          private:
+          	bool do_is_initialized() const noexcept override { return is_initialized_; }
+          	Logger& do_get_logger() override { return logger_; }
+          	DisplayMode do_get_current_display_mode() override { return display_mode_; }
+
+          	// Fixed screen: the only mode is the native one.
+          	Span<const DisplayMode> do_get_display_modes() override
+          	{
+          		return Span<const DisplayMode>{&display_mode_, 1};
+          	}
+
+          	GlCurrentContext& do_get_gl_current_context() override { return *gl_current_context_; }
+          	VulkanMgr& do_get_vulkan_mgr() override { return *vulkan_mgr_; }
+          	MouseMgr& do_get_mouse_mgr() override { return *mouse_mgr_; }
+          	WindowMgr& do_get_window_mgr() override { return *window_mgr_; }
+          };
+
+          } // namespace
+
+          // ==========================================================================
+
+          VideoMgrUPtr make_ios_video_mgr(Logger& logger)
+          try {
+          	return std::make_unique<IosVideoMgr>(logger);
+          } BSTONE_END_FUNC_CATCH_ALL_THROW_NESTED
+
+          } // namespace sys
+          } // namespace bstone
+          BSIOS_EOF
+          mkdir -p "$(dirname 'ios/src/sys/bstone_sys_window_ios.cpp')"
+          cat > 'ios/src/sys/bstone_sys_window_ios.cpp' <<'BSIOS_EOF'
+          /*
+          BStone iOS port: window manager, window and OpenGL ES context (replace bstone_sys_window*_sdl2.cpp
+          and bstone_sys_gl_context_sdl2.cpp).
+
+          There is exactly one real window on iOS: the full-screen game view owned by the UI layer. A
+          sys::Window object is therefore a light-weight handle; the actual EAGL context is created by
+          bsios_gl_create() when Window::make_gl_context() is called.
+
+          BStone creates and destroys several temporary windows / contexts while probing MSAA. This is
+          supported: creating a new context destroys the previous one; destroying a stale GlContext object
+          (its generation is outdated) is a no-op.
+          SPDX-License-Identifier: MIT
+          */
+
+          #include <memory>
+          #include <string>
+
+          #include "bstone_exception.h"
+          #include "bstone_sys_display_mode.h"
+          #include "bstone_sys_gl_context.h"
+          #include "bstone_sys_window.h"
+          #include "bstone_sys_window_mgr.h"
+
+          #include "bstone_sys_ios.h"
+          #include "bsios_bridge.h"
+
+          namespace bstone {
+          namespace sys {
+
+          namespace {
+
+          unsigned int g_gl_generation = 0;
+
+          // ==========================================================================
+
+          class IosGlContext final : public GlContext
+          {
+          public:
+          	explicit IosGlContext(const GlContextAttributes& requested)
+          	{
+          		if (requested.profile != GlContextProfile::es || requested.major_version != 2)
+          		{
+          			BSTONE_THROW_STATIC_SOURCE("Only OpenGL ES 2.0 is available on iOS.");
+          		}
+
+          		// Free the previous context first (only one drawable exists).
+          		bsios_gl_destroy();
+
+          		if (bsios_gl_create(requested.depth_bit_count) != 0)
+          		{
+          			BSTONE_THROW_STATIC_SOURCE("Failed to create an OpenGL ES 2.0 context.");
+          		}
+
+          		generation_ = ++g_gl_generation;
+
+          		// Report what was really created. Multisampling is never available on the window
+          		// (iOS offers no multisampled default framebuffer), so the MSAA probe stops here.
+          		attributes_ = GlContextAttributes{};
+          		attributes_.is_accelerated = true;
+          		attributes_.profile = GlContextProfile::es;
+          		attributes_.major_version = 2;
+          		attributes_.minor_version = 0;
+          		attributes_.multisample_buffer_count = 0;
+          		attributes_.multisample_sample_count = 0;
+          		attributes_.red_bit_count = 8;
+          		attributes_.green_bit_count = 8;
+          		attributes_.blue_bit_count = 8;
+          		attributes_.alpha_bit_count = 0;
+          		attributes_.depth_bit_count = requested.depth_bit_count;
+          	}
+
+          	IosGlContext(const IosGlContext&) = delete;
+          	IosGlContext& operator=(const IosGlContext&) = delete;
+
+          	~IosGlContext() override
+          	{
+          		if (generation_ == g_gl_generation)
+          		{
+          			bsios_gl_destroy();
+          		}
+          	}
+
+          private:
+          	GlContextAttributes attributes_{};
+          	unsigned int generation_{};
+
+          private:
+          	const GlContextAttributes& do_get_attributes() const noexcept override
+          	{
+          		return attributes_;
+          	}
+          };
+
+          // ==========================================================================
+
+          class IosWindow final : public Window
+          {
+          public:
+          	explicit IosWindow(const WindowInitParam& param)
+          	{
+          		if (param.title != nullptr)
+          		{
+          			title_ = param.title;
+          		}
+
+          		if (param.renderer_type != WindowRendererType::open_gl || param.gl_attributes == nullptr)
+          		{
+          			BSTONE_THROW_STATIC_SOURCE("Only OpenGL ES windows are supported on iOS.");
+          		}
+
+          		gl_attributes_ = *param.gl_attributes;
+          		refresh_size();
+          	}
+
+          	IosWindow(const IosWindow&) = delete;
+          	IosWindow& operator=(const IosWindow&) = delete;
+
+          	~IosWindow() override = default;
+
+          private:
+          	std::string title_{};
+          	GlContextAttributes gl_attributes_{};
+          	WindowSize size_{};
+          	int refresh_rate_{60};
+
+          private:
+          	void refresh_size()
+          	{
+          		bsios_screen_get_size(&size_.width, &size_.height);
+          		refresh_rate_ = bsios_screen_get_refresh_rate();
+          	}
+
+          	const char* do_get_title() override
+          	{
+          		return title_.c_str();
+          	}
+
+          	void do_set_title(const char* title) override
+          	{
+          		title_ = (title != nullptr ? title : "");
+          	}
+
+          	// The window always covers the whole screen.
+          	WindowPosition do_get_position() override
+          	{
+          		return WindowPosition{WindowOffset{0}, WindowOffset{0}};
+          	}
+
+          	void do_set_position(WindowPosition) override
+          	{}
+
+          	WindowSize do_get_size() override
+          	{
+          		refresh_size();
+          		return size_;
+          	}
+
+          	void do_set_size(WindowSize) override
+          	{}
+
+          	DisplayMode do_get_display_mode() override
+          	{
+          		refresh_size();
+          		return DisplayMode{size_.width, size_.height, refresh_rate_};
+          	}
+
+          	void do_set_display_mode(const DisplayMode&) override
+          	{}
+
+          	void do_show(bool) override
+          	{}
+
+          	void do_set_rounded_corner_type(WindowRoundedCornerType) override
+          	{}
+
+          	WindowFullscreenType do_get_fullscreen_mode() override
+          	{
+          		return WindowFullscreenType::fake;
+          	}
+
+          	void do_set_fullscreen_mode(WindowFullscreenType) override
+          	{}
+
+          	GlContextUPtr do_make_gl_context() override
+          	{
+          		return std::make_unique<IosGlContext>(gl_attributes_);
+          	}
+
+          	WindowSize do_gl_get_drawable_size() override
+          	{
+          		auto size = WindowSize{};
+          		bsios_gl_get_drawable_size(&size.width, &size.height);
+          		return size;
+          	}
+
+          	void do_gl_swap_buffers() override
+          	{
+          		bsios_gl_swap();
+          	}
+
+          	// The software (SDL_Renderer based) path is not available; the 3D GLES 2.0 renderer is used.
+          	RendererUPtr do_make_renderer(const RendererInitParam&) override
+          	{
+          		BSTONE_THROW_STATIC_SOURCE("The software renderer is not available on iOS; use the \"gles_2_0\" renderer.");
+          	}
+          };
+
+          // ==========================================================================
+
+          class IosWindowMgr final : public WindowMgr
+          {
+          public:
+          	explicit IosWindowMgr(Logger& logger)
+          		:
+          		logger_{logger}
+          	{
+          		logger_.log_information("Start up iOS window manager.");
+          	}
+
+          	~IosWindowMgr() override
+          	{
+          		logger_.log_information("Shut down iOS window manager.");
+          	}
+
+          private:
+          	Logger& logger_;
+
+          private:
+          	WindowUPtr do_make_window(const WindowInitParam& param) override
+          	{
+          		return std::make_unique<IosWindow>(param);
+          	}
+          };
+
+          } // namespace
+
+          // ==========================================================================
+
+          WindowMgrUPtr make_ios_window_mgr(Logger& logger)
+          try {
+          	return std::make_unique<IosWindowMgr>(logger);
+          } BSTONE_END_FUNC_CATCH_ALL_THROW_NESTED
+
+          } // namespace sys
+          } // namespace bstone
+          BSIOS_EOF
+          mkdir -p "$(dirname 'ios/tools/gen_sources.py')"
+          cat > 'ios/tools/gen_sources.py' <<'BSIOS_EOF'
+          #!/usr/bin/env python3
+          """Generates ios/sources.mk (the list of C++ translation units for the iOS build) from the CMake
+          source lists of BStone, so the Theos Makefile does not drift from upstream.
+
+          Excluded: SDL2 / Win32 / OpenAL-less pieces that are replaced by ios/src/sys/*.cpp, tests, and
+          anything not a translation unit.
+          Usage: python3 ios/tools/gen_sources.py   (run from the repository root)
+          """
+          import os
+          import re
+          import sys
+
+          root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+          cmake = open(os.path.join(root, 'src/bstone/CMakeLists.txt')).read()
+
+          listed = re.findall(r'^\s*(src/[^\s)]+\.cpp)\s*$', cmake, re.M)
+
+          EXCLUDE = [
+              r'_sdl2',            # replaced by ios/src/sys
+              r'win32',            # Win32 only
+              r'bstone_process_posix\.cpp',   # fork()/exec() are unavailable on iOS -> ios/src/sys/bstone_sys_misc_ios.cpp
+              r'bstone_entry_point\.cpp',     # Windows-only wmain shim
+              r'_tests?\.cpp',
+          ]
+
+          srcs = []
+          for f in listed:
+              if any(re.search(p, f) for p in EXCLUDE):
+                  continue
+              if f not in srcs:
+                  srcs.append(f)
+          srcs.sort()
+
+          def emit(var, prefix, files):
+              out = [var + ' = \\']
+              out += ['\t%s%s \\' % (prefix, f) for f in files]
+              out[-1] = out[-1].rstrip(' \\')
+              return '\n'.join(out)
+
+          libs = [
+              ('../src/lib/nuked_opl3/src/opl3.cpp'),
+              ('../src/lib/xbrz/src/xbrz.cpp'),
+              ('../src/lib/vulkan/src/bstone_vulkan.cpp'),
+          ]
+
+          with open(os.path.join(root, 'ios/sources.mk'), 'w') as fp:
+              fp.write('# GENERATED by ios/tools/gen_sources.py -- do not edit by hand.\n\n')
+              fp.write(emit('BSTONE_ENGINE_FILES', '../src/bstone/', srcs) + '\n\n')
+              fp.write(emit('BSTONE_LIB_FILES', '', libs) + '\n')
+
+          print('%d engine files, %d lib files' % (len(srcs), len(libs)))
+          BSIOS_EOF
+          mkdir -p "$(dirname 'ios/tools/gen_version.sh')"
+          cat > 'ios/tools/gen_version.sh' <<'BSIOS_EOF'
+          #!/bin/sh
+          # Generates build/gen/bstone_version_.h (replacement of CMake's configure_file) -- run by the Makefile.
+          mkdir -p "$1" && printf '1, 3, 4, "", "ios7", "1.3.4+ios7", "1.3.4+ios7",\n' > "$1/bstone_version_.h"
+          BSIOS_EOF
+          chmod +x ios/tools/*.sh ios/tools/*.py
+          find ios -type f | sort
+
+      - name: Patch the BStone core for iOS (BSTONE_IOS)
+        working-directory: ${{ env.BS_ROOT }}
+        run: |
+          cat > /tmp/core.patch <<'BSIOS_EOF'
+          diff -ruN '--exclude=ios' a/src/bstone/src/3d_main.cpp b/src/bstone/src/3d_main.cpp
+          --- a/src/bstone/src/3d_main.cpp	2026-11-23 12:51:50.242782845 +0000
+          +++ b/src/bstone/src/3d_main.cpp	2026-11-23 12:51:50.879046829 +0000
+          @@ -9928,9 +9928,16 @@
+           	TP_Presenter(&pi);
+           }
+           
+          +#ifdef BSTONE_IOS
+          +// iOS: UIApplicationMain() owns the real main(); the game runs on its own thread (see ios/src/app).
+          +extern "C" int bstone_game_main(
+          +	int argc,
+          +	char* argv[])
+          +#else
+           int main(
+           	int argc,
+           	char* argv[])
+          +#endif
+           {
+           #ifdef __vita__
+           	scePowerSetArmClockFrequency(444);
+          diff -ruN '--exclude=ios' a/src/bstone/src/bstone_gl_r3r.cpp b/src/bstone/src/bstone_gl_r3r.cpp
+          --- a/src/bstone/src/bstone_gl_r3r.cpp	2026-11-23 12:51:50.250340952 +0000
+          +++ b/src/bstone/src/bstone_gl_r3r.cpp	2026-11-23 12:51:50.880764451 +0000
+          @@ -541,8 +541,11 @@
+           	is_flipped_vertically = true;
+           	bind_framebuffers_for_read_pixels();
+           
+          -	glReadBuffer(GL_BACK);
+          -	GlR3rError::ensure_no_errors();
+          +	if (glReadBuffer != nullptr) // Not available in OpenGL ES 2.0.
+          +	{
+          +		glReadBuffer(GL_BACK);
+          +		GlR3rError::ensure_no_errors();
+          +	}
+             
+           	glReadPixels(0, 0, screen_width_, screen_height_, GL_RGB, GL_UNSIGNED_BYTE, buffer);
+           	GlR3rError::ensure_no_errors();
+          diff -ruN '--exclude=ios' a/src/bstone/src/bstone_hw_video.cpp b/src/bstone/src/bstone_hw_video.cpp
+          --- a/src/bstone/src/bstone_hw_video.cpp	2026-11-23 12:51:50.329354949 +0000
+          +++ b/src/bstone/src/bstone_hw_video.cpp	2026-11-23 12:51:50.881692149 +0000
+          @@ -2991,6 +2991,10 @@
+           
+           	if (is_auto_detect)
+           	{
+          +#ifdef BSTONE_IOS
+          +		// iOS: only OpenGL ES 2.0 is available (and only that is implemented by the iOS sys layer).
+          +		renderer_type_list = {R3rType::gles_2_0};
+          +#else
+           		renderer_type_list =
+           		{
+           			R3rType::vulkan,
+          @@ -3006,6 +3010,7 @@
+           #endif
+           #endif
+           		};
+          +#endif // BSTONE_IOS
+           	}
+           	else
+           	{
+          diff -ruN '--exclude=ios' a/src/bstone/src/bstone_process_posix.cpp b/src/bstone/src/bstone_process_posix.cpp
+          --- a/src/bstone/src/bstone_process_posix.cpp	2026-11-23 12:51:50.334481443 +0000
+          +++ b/src/bstone/src/bstone_process_posix.cpp	2026-11-23 12:51:50.883491070 +0000
+          @@ -6,7 +6,7 @@
+           
+           // Process utils.
+           
+          -#ifndef _WIN32
+          +#if !defined(_WIN32) && !defined(BSTONE_IOS)
+           
+           //#define BSTONE_PROCESS_DEBUG
+           
+          diff -ruN '--exclude=ios' a/src/bstone/src/bstone_time.cpp b/src/bstone/src/bstone_time.cpp
+          --- a/src/bstone/src/bstone_time.cpp	2026-11-23 12:51:50.344499703 +0000
+          +++ b/src/bstone/src/bstone_time.cpp	2026-11-23 12:51:50.886410044 +0000
+          @@ -11,6 +11,7 @@
+           #include <windows.h>
+           #else
+           #include <time.h>
+          +#include <sys/time.h>
+           #endif // _WIN32
+           
+           #include <string>
+          @@ -41,6 +42,21 @@
+           
+           	return date_time;
+           #else
+          +#ifdef BSTONE_IOS
+          +	// clock_gettime() is available only since iOS 10; the target here is iOS 7.
+          +	struct ::timeval posix_tv;
+          +
+          +	if (::gettimeofday(&posix_tv, nullptr) != 0)
+          +	{
+          +		BSTONE_THROW_STATIC_SOURCE("Failed to get clock time.");
+          +	}
+          +
+          +	struct
+          +	{
+          +		::time_t tv_sec;
+          +		long tv_nsec;
+          +	} posix_tp = {posix_tv.tv_sec, static_cast<long>(posix_tv.tv_usec) * 1000L};
+          +#else
+           	struct ::timespec posix_tp;
+           
+           	const auto clock_gettime_result = ::clock_gettime(CLOCK_REALTIME, &posix_tp);
+          @@ -49,6 +65,7 @@
+           	{
+           		BSTONE_THROW_STATIC_SOURCE("Failed to get clock time.");
+           	}
+          +#endif
+           
+           	struct ::tm posix_tm;
+           
+          diff -ruN '--exclude=ios' a/src/bstone/src/id_sd.cpp b/src/bstone/src/id_sd.cpp
+          --- a/src/bstone/src/id_sd.cpp	2026-11-23 12:51:50.382537464 +0000
+          +++ b/src/bstone/src/id_sd.cpp	2026-11-23 12:51:50.888476062 +0000
+          @@ -477,7 +477,9 @@
+           
+           		if (user_driver_type == AudioDriverType::auto_detect)
+           		{
+          +#ifndef BSTONE_IOS
+           			driver_types.emplace_back(AudioDriverType::openal);
+          +#endif
+           			driver_types.emplace_back(AudioDriverType::system);
+           		}
+           		else
+          BSIOS_EOF
+          if patch -p1 -R --dry-run -s < /tmp/core.patch >/dev/null 2>&1; then
+            echo "core already patched"
+          else
+            patch -p1 < /tmp/core.patch
+          fi
+
+      - name: Generate source list
+        working-directory: ${{ env.BS_ROOT }}
+        run: python3 ios/tools/gen_sources.py
+
+      - name: Build .deb + .app via Theos
+        working-directory: ${{ env.BS_ROOT }}/ios
+        env:
+          FINALPACKAGE: "1"
+        run: |
+          make package FINALPACKAGE=1 -j"$(nproc)"
+          ls -la packages
+
+      - name: Verify deployment target is iOS 7.0
+        working-directory: ${{ env.BS_ROOT }}/ios
+        run: |
+          export PATH="$THEOS/toolchain/linux/iphone/bin:$PATH"
+          BIN="$(find .theos -type f -name BStoneiOS7 | head -n1)"
+          echo "Binary: $BIN"
+          OT="$(command -v llvm-otool || command -v otool || true)"
+          [ -n "$OT" ] || { echo "no otool; skipping"; exit 0; }
+          "$OT" -l "$BIN" > /tmp/lc.txt
+          grep -A3 LC_VERSION_MIN_IPHONEOS /tmp/lc.txt || true
+          grep -q LC_VERSION_MIN_IPHONEOS /tmp/lc.txt || { echo "missing LC_VERSION_MIN_IPHONEOS"; exit 1; }
+          if grep -q LC_BUILD_VERSION /tmp/lc.txt; then echo "LC_BUILD_VERSION: old dyld cannot load it"; exit 1; fi
+          grep -A3 LC_VERSION_MIN_IPHONEOS /tmp/lc.txt | grep -q "version 7.0" || { echo "deployment target is not 7.0"; exit 1; }
+
+      - name: Pack .ipa
+        working-directory: ${{ env.BS_ROOT }}/ios
+        run: |
+          APP_DIR="$(find .theos -type d -name 'BStoneiOS7.app' | head -n1)"
+          echo "Using APP_DIR=$APP_DIR"
+          rm -rf ipa_build && mkdir -p ipa_build/Payload
+          cp -a "$APP_DIR" ipa_build/Payload/
+          (cd ipa_build && zip -rq ../packages/BStone-iOS7-armv7.ipa Payload)
+          ls -la packages
+
+      - name: Upload .ipa + .deb
+        uses: actions/upload-artifact@v4
+        with:
+          name: BStone-iOS7-armv7
+          path: |
+            ${{ env.BS_ROOT }}/ios/packages/*.ipa
+            ${{ env.BS_ROOT }}/ios/packages/*.deb
+          if-no-files-found: error
+          retention-days: 30
