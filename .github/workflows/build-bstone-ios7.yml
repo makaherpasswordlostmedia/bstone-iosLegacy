@@ -467,6 +467,12 @@ jobs:
           	if (e != GL_NO_ERROR) bsios_trace("GL ERROR 0x%04X after %s", (unsigned)e, where);
           }
 
+          // Every driver call is announced BEFORE it is made: the last line of bstone_trace.txt names the call that crashed.
+          static void TraceGLString(const char* label, GLenum name) {
+          	bsios_trace("calling glGetString(%s)", label);
+          	bsios_trace("%s=%s", label, GLStr(name));
+          }
+
           extern "C" int bsios_gl_create(int depth_bits) {
           	bsios_trace("bsios_gl_create(depth_bits=%d)", depth_bits);
           	bsios_trace_mem("before gl create");
@@ -481,24 +487,34 @@ jobs:
           	            (double)view.bounds.size.height, (double)view.contentScaleFactor,
           	            NSStringFromClass([view.layer class]).UTF8String);
 
+          	bsios_trace("calling [EAGLContext initWithAPI:ES2] (thread is main=%d)", (int)[NSThread isMainThread]);
           	g_ctx = [[EAGLContext alloc] initWithAPI:kEAGLRenderingAPIOpenGLES2];
           	bsios_trace("EAGLContext(ES2) = %p", (__bridge void*)g_ctx);
-          	if (!g_ctx || ![EAGLContext setCurrentContext:g_ctx]) {
-          		bsios_trace("EAGLContext create/setCurrentContext FAILED -> -2");
+          	if (!g_ctx) {
+          		bsios_trace("EAGLContext creation FAILED -> -2");
+          		return -2;
+          	}
+
+          	bsios_trace("calling [EAGLContext setCurrentContext:]");
+          	BOOL made_current = [EAGLContext setCurrentContext:g_ctx];
+          	bsios_trace("setCurrentContext -> %d", (int)made_current);
+          	if (!made_current) {
           		g_ctx = nil;
           		return -2;
           	}
 
-          	bsios_trace("GL_VENDOR=%s", GLStr(GL_VENDOR));
-          	bsios_trace("GL_RENDERER=%s", GLStr(GL_RENDERER));
-          	bsios_trace("GL_VERSION=%s", GLStr(GL_VERSION));
-          	bsios_trace("GL_SHADING_LANGUAGE_VERSION=%s", GLStr(GL_SHADING_LANGUAGE_VERSION));
+          	TraceGLString("GL_VENDOR", GL_VENDOR);
+          	TraceGLString("GL_RENDERER", GL_RENDERER);
+          	TraceGLString("GL_VERSION", GL_VERSION);
+          	TraceGLString("GL_SHADING_LANGUAGE_VERSION", GL_SHADING_LANGUAGE_VERSION);
           	{
+          		bsios_trace("calling glGetString(GL_EXTENSIONS)");
           		const char* ext = GLStr(GL_EXTENSIONS);
           		size_t len = strlen(ext);
           		for (size_t i = 0; i < len; i += 400) bsios_trace("GL_EXTENSIONS[%zu]: %.400s", i, ext + i);
           	}
           	{
+          		bsios_trace("calling glGetIntegerv(limits)");
           		GLint v = 0;
           		glGetIntegerv(GL_MAX_TEXTURE_SIZE, &v);
           		GLint rb = 0;
@@ -512,6 +528,7 @@ jobs:
           	}
           	TraceGLError("context creation / queries");
 
+          	bsios_trace("calling glGen/BindFramebuffer + glGen/BindRenderbuffer");
           	glGenFramebuffers(1, &g_fbo);
           	glGenRenderbuffers(1, &g_color_rb);
           	glBindFramebuffer(GL_FRAMEBUFFER, g_fbo);
@@ -519,6 +536,7 @@ jobs:
           	bsios_trace("fbo=%u color_rb=%u", (unsigned)g_fbo, (unsigned)g_color_rb);
           	TraceGLError("fbo/renderbuffer generation");
 
+          	bsios_trace("calling [EAGLContext renderbufferStorage:fromDrawable:]");
           	if (![g_ctx renderbufferStorage:GL_RENDERBUFFER fromDrawable:(CAEAGLLayer*)view.layer]) {
           		bsios_trace("renderbufferStorage:fromDrawable: FAILED -> -3");
           		DestroyGLObjects();
@@ -531,6 +549,7 @@ jobs:
           	TraceGLError("color attachment");
 
           	if (depth_bits > 0) {
+          		bsios_trace("calling depth renderbuffer setup");
           		glGenRenderbuffers(1, &g_depth_rb);
           		glBindRenderbuffer(GL_RENDERBUFFER, g_depth_rb);
           		// 24-bit depth (GL_OES_depth24) exists on every iOS 7 capable GPU, but 16 bits is what
@@ -542,6 +561,7 @@ jobs:
           		TraceGLError("depth attachment");
           	}
 
+          	bsios_trace("calling glCheckFramebufferStatus");
           	GLenum status = glCheckFramebufferStatus(GL_FRAMEBUFFER);
           	bsios_trace("glCheckFramebufferStatus = 0x%04X", (unsigned)status);
           	if (status != GL_FRAMEBUFFER_COMPLETE) {
@@ -1560,10 +1580,14 @@ jobs:
           #include <unistd.h>
           #include <dlfcn.h>
           #include <exception>
+          #include <setjmp.h>
           #include <sys/stat.h>
           #include <sys/time.h>
           #include <sys/ucontext.h>
           #include <mach/mach.h>
+          #include <mach/thread_act.h>
+          #include <mach/thread_status.h>
+          #include <mach/vm_region.h>
           #include <mach-o/dyld.h>
           #include <mach-o/loader.h>
 
@@ -1598,7 +1622,10 @@ jobs:
           ThreadSlot g_threads[kMaxThreads];
           volatile int g_thread_count = 0;
 
-          volatile sig_atomic_t g_in_crash = 0;
+          volatile int g_in_crash = 0;
+          pthread_t g_crash_thread;
+          sigjmp_buf g_guard_jmp;
+          volatile sig_atomic_t g_guard_armed = 0;
           volatile sig_atomic_t g_terminate_active = 0;
           volatile sig_atomic_t g_report_written = 0;
 
@@ -1834,16 +1861,11 @@ jobs:
           {
           	const uint32_t count = _dyld_image_count();
 
-          	ws(fd, "-- images (system libraries omitted; 'unslid' = address - slide, use it with the symbol list) --\n");
+          	ws(fd, "-- all loaded images ('unslid' = address - slide; look for GL driver bundles) --\n");
 
           	for (uint32_t i = 0; i < count; ++i)
           	{
           		const char* const name = _dyld_get_image_name(i);
-
-          		if (name != nullptr && (strncmp(name, "/usr/lib/", 9) == 0 || strncmp(name, "/System/", 8) == 0))
-          		{
-          			continue;
-          		}
 
           		ws(fd, "  image[");
           		wd(fd, static_cast<long>(i));
@@ -1922,6 +1944,9 @@ jobs:
           	uintptr_t sp;
           	uintptr_t fp;
           	uintptr_t cpsr;
+          	uintptr_t far_addr;
+          	uintptr_t fsr;
+          	uintptr_t exception;
           	uintptr_t r[13];
           	bool has_all;
           };
@@ -1948,6 +1973,10 @@ jobs:
           	out->pc = ss.__pc;
           	out->cpsr = ss.__cpsr;
           	out->fp = ss.__r[7];
+          	const auto& es = uc->uc_mcontext->__es;
+          	out->far_addr = es.__far;
+          	out->fsr = es.__fsr;
+          	out->exception = es.__exception;
           	out->has_all = true;
           	return true;
           #elif defined(__aarch64__)
@@ -1970,6 +1999,10 @@ jobs:
           	out->pc = static_cast<uintptr_t>(ss.__pc);
           	out->cpsr = static_cast<uintptr_t>(ss.__cpsr);
           	out->fp = static_cast<uintptr_t>(ss.__fp);
+          	const auto& es = uc->uc_mcontext->__es;
+          	out->far_addr = static_cast<uintptr_t>(es.__far);
+          	out->fsr = static_cast<uintptr_t>(es.__esr);
+          	out->exception = static_cast<uintptr_t>(es.__exception);
           	out->has_all = true;
           	return true;
           #else
@@ -1977,6 +2010,194 @@ jobs:
           	static_cast<void>(out);
           	return false;
           #endif
+          }
+
+          // Never faults: returns false for unmapped memory instead of raising a signal.
+          bool safe_read(uintptr_t addr, void* out, size_t n)
+          {
+          	vm_size_t got = 0;
+          	const kern_return_t kr = vm_read_overwrite(mach_task_self(), static_cast<vm_address_t>(addr),
+          		static_cast<vm_size_t>(n), static_cast<vm_address_t>(reinterpret_cast<uintptr_t>(out)), &got);
+          	return kr == KERN_SUCCESS && got == static_cast<vm_size_t>(n);
+          }
+
+          void wbyte(int fd, uint8_t b)
+          {
+          	static const char hex[] = "0123456789abcdef";
+          	char two[3] = {hex[b >> 4], hex[b & 0xF], 0};
+          	ws(fd, two);
+          }
+
+          // ARMv7 data fault status register -> text (short-descriptor format).
+          const char* fsr_text(uintptr_t fsr)
+          {
+          	const unsigned status = static_cast<unsigned>((fsr & 0xF) | ((fsr >> 6) & 0x10));
+
+          	switch (status)
+          	{
+          		case 0x01: return "ALIGNMENT FAULT (unaligned access of a type that needs alignment)";
+          		case 0x02: return "debug event";
+          		case 0x03: return "access flag fault (section)";
+          		case 0x05: return "translation fault, section (address not mapped)";
+          		case 0x06: return "access flag fault (page)";
+          		case 0x07: return "translation fault, page (address not mapped)";
+          		case 0x08: return "synchronous external abort";
+          		case 0x09: return "domain fault (section)";
+          		case 0x0B: return "domain fault (page)";
+          		case 0x0D: return "permission fault, section (e.g. write to read-only / exec of no-exec)";
+          		case 0x0F: return "permission fault, page (e.g. write to read-only / exec of no-exec)";
+          		case 0x16: return "asynchronous external abort";
+          		default: return "other / unknown status";
+          	}
+          }
+
+          void dump_region(int fd, const char* label, uintptr_t addr)
+          {
+          	ws(fd, "  ");
+          	ws(fd, label);
+          	ws(fd, " ");
+          	wh(fd, addr);
+          	ws(fd, ": ");
+
+          	vm_address_t start = static_cast<vm_address_t>(addr);
+          	vm_size_t size = 0;
+          	vm_region_basic_info_data_64_t info;
+          	mach_msg_type_number_t count = VM_REGION_BASIC_INFO_COUNT_64;
+          	mach_port_t object_name = 0;
+
+          	const kern_return_t kr = vm_region_64(mach_task_self(), &start, &size, VM_REGION_BASIC_INFO_64,
+          		reinterpret_cast<vm_region_info_t>(&info), &count, &object_name);
+
+          	if (kr != KERN_SUCCESS)
+          	{
+          		ws(fd, "no mapped region at or above this address\n");
+          		return;
+          	}
+
+          	if (static_cast<uintptr_t>(start) > addr)
+          	{
+          		ws(fd, "NOT MAPPED (next region starts at ");
+          		wh(fd, static_cast<uintptr_t>(start));
+          		ws(fd, ")\n");
+          		return;
+          	}
+
+          	ws(fd, "mapped region ");
+          	wh(fd, static_cast<uintptr_t>(start));
+          	ws(fd, "..");
+          	wh(fd, static_cast<uintptr_t>(start) + static_cast<uintptr_t>(size));
+          	ws(fd, " prot=");
+          	ws(fd, (info.protection & VM_PROT_READ) != 0 ? "r" : "-");
+          	ws(fd, (info.protection & VM_PROT_WRITE) != 0 ? "w" : "-");
+          	ws(fd, (info.protection & VM_PROT_EXECUTE) != 0 ? "x" : "-");
+          	ws(fd, " max=");
+          	ws(fd, (info.max_protection & VM_PROT_READ) != 0 ? "r" : "-");
+          	ws(fd, (info.max_protection & VM_PROT_WRITE) != 0 ? "w" : "-");
+          	ws(fd, (info.max_protection & VM_PROT_EXECUTE) != 0 ? "x" : "-");
+          	ws(fd, info.shared != 0 ? " shared" : " private");
+          	ws(fd, "\n");
+          }
+
+          void dump_code_bytes(int fd, uintptr_t pc, bool thumb)
+          {
+          	const uintptr_t base = (pc & ~static_cast<uintptr_t>(1)) - 16;
+          	uint8_t code[32];
+
+          	ws(fd, thumb ? "  code (THUMB) from pc-16: " : "  code (ARM) from pc-16: ");
+
+          	if (!safe_read(base, code, sizeof(code)))
+          	{
+          		ws(fd, "(not readable)\n");
+          		return;
+          	}
+
+          	for (size_t i = 0; i < sizeof(code); ++i)
+          	{
+          		if (i == 16)
+          		{
+          			ws(fd, "| "); // the faulting instruction starts here
+          		}
+
+          		wbyte(fd, code[i]);
+          		ws(fd, " ");
+          	}
+
+          	ws(fd, "\n");
+          }
+
+          void dump_stack_words(int fd, uintptr_t sp)
+          {
+          	ws(fd, "-- stack words from sp (annotated when they point into an image) --\n");
+
+          	for (int i = 0; i < 48; ++i)
+          	{
+          		uintptr_t w = 0;
+
+          		if (!safe_read(sp + static_cast<uintptr_t>(i) * sizeof(uintptr_t), &w, sizeof(w)))
+          		{
+          			ws(fd, "  (stack not readable from here)\n");
+          			return;
+          		}
+
+          		ws(fd, "  sp+");
+          		wh(fd, static_cast<uintptr_t>(i) * sizeof(uintptr_t));
+          		ws(fd, ": ");
+          		wh(fd, w);
+
+          		uint32_t image_index = 0;
+          		intptr_t slide = 0;
+          		const uintptr_t clean = w & ~static_cast<uintptr_t>(1);
+
+          		if (w > 0x1000 && find_image(clean, &image_index, &slide))
+          		{
+          			const char* const name = _dyld_get_image_name(image_index);
+          			const char* base = name;
+
+          			for (const char* q = name; q != nullptr && *q != 0; ++q)
+          			{
+          				if (*q == '/')
+          				{
+          					base = q + 1;
+          				}
+          			}
+
+          			ws(fd, "  ");
+          			ws(fd, base);
+          			ws(fd, " unslid=");
+          			wh(fd, clean - static_cast<uintptr_t>(slide));
+          		}
+
+          		ws(fd, "\n");
+          	}
+          }
+
+          void dump_register_targets(int fd, const Regs& g)
+          {
+          	ws(fd, "-- memory behind registers (16 bytes each, only if readable) --\n");
+
+          	for (int i = 0; i < 13; ++i)
+          	{
+          		uint8_t buf[16];
+
+          		if (g.r[i] < 0x1000 || !safe_read(g.r[i], buf, sizeof(buf)))
+          		{
+          			continue;
+          		}
+
+          		ws(fd, "  [r");
+          		wd(fd, i);
+          		ws(fd, "=");
+          		wh(fd, g.r[i]);
+          		ws(fd, "]: ");
+
+          		for (size_t k = 0; k < sizeof(buf); ++k)
+          		{
+          			wbyte(fd, buf[k]);
+          			ws(fd, " ");
+          		}
+
+          		ws(fd, "\n");
+          	}
           }
 
           void dump_registers(int fd, const Regs& g)
@@ -2005,10 +2226,6 @@ jobs:
 
           void dump_backtrace(int fd, const Regs& g, bool symbolize)
           {
-          	const pthread_t self = pthread_self();
-          	const uintptr_t top = reinterpret_cast<uintptr_t>(pthread_get_stackaddr_np(self));
-          	const uintptr_t low = top - static_cast<uintptr_t>(pthread_get_stacksize_np(self));
-
           	int depth = 0;
           	dump_frame(fd, depth++, g.pc, symbolize);
 
@@ -2022,27 +2239,31 @@ jobs:
 
           	while (depth < 60)
           	{
-          		if (fp == 0 || (fp & (sizeof(uintptr_t) - 1)) != 0 || fp < low || fp + 2 * sizeof(uintptr_t) > top)
+          		if (fp == 0 || (fp & (sizeof(uintptr_t) - 1)) != 0 || (g.sp != 0 && fp < g.sp))
           		{
           			break;
           		}
 
-          		const uintptr_t next = reinterpret_cast<const uintptr_t*>(fp)[0];
-          		const uintptr_t ret = reinterpret_cast<const uintptr_t*>(fp)[1];
+          		uintptr_t frame[2] = {0, 0};
 
-          		if (ret == 0)
+          		if (!safe_read(fp, frame, sizeof(frame)))
           		{
           			break;
           		}
 
-          		dump_frame(fd, depth++, ret, symbolize);
-
-          		if (next <= fp)
+          		if (frame[1] == 0)
           		{
           			break;
           		}
 
-          		fp = next;
+          		dump_frame(fd, depth++, frame[1], symbolize);
+
+          		if (frame[0] <= fp)
+          		{
+          			break;
+          		}
+
+          		fp = frame[0];
           	}
           }
 
@@ -2093,7 +2314,152 @@ jobs:
 
           	dump_ring(fd);
           	dump_images(fd);
-          	ws(fd, "==== end of report ====\n");
+          }
+
+          #if defined(__arm__) || defined(BS_TEST_ARM32)
+          void dump_other_threads(int fd)
+          {
+          	thread_act_array_t threads = nullptr;
+          	mach_msg_type_number_t count = 0;
+
+          	if (task_threads(mach_task_self(), &threads, &count) != KERN_SUCCESS)
+          	{
+          		ws(fd, "(task_threads failed)\n");
+          		return;
+          	}
+
+          	ws(fd, "-- all other threads (total ");
+          	wd(fd, static_cast<long>(count));
+          	ws(fd, ") --\n");
+
+          	const mach_port_t self_thread = mach_thread_self();
+
+          	for (mach_msg_type_number_t i = 0; i < count; ++i)
+          	{
+          		if (threads[i] == self_thread)
+          		{
+          			continue;
+          		}
+
+          		thread_suspend(threads[i]);
+
+          		arm_thread_state_t st;
+          		memset(&st, 0, sizeof(st));
+          		mach_msg_type_number_t st_count = static_cast<mach_msg_type_number_t>(sizeof(st) / sizeof(natural_t));
+          		const kern_return_t kr = thread_get_state(threads[i], ARM_THREAD_STATE,
+          			reinterpret_cast<thread_state_t>(&st), &st_count);
+
+          		char name[40];
+          		name[0] = 0;
+          		const pthread_t pt = pthread_from_mach_thread_np(threads[i]);
+
+          		if (pt)
+          		{
+          			pthread_getname_np(pt, name, sizeof(name));
+          		}
+
+          		ws(fd, "  thread #");
+          		wd(fd, static_cast<long>(i));
+          		ws(fd, " name='");
+          		ws(fd, name);
+          		ws(fd, "'\n");
+
+          		if (kr == KERN_SUCCESS)
+          		{
+          			Regs r;
+          			memset(&r, 0, sizeof(r));
+          			r.pc = st.__pc;
+          			r.lr = st.__lr;
+          			r.sp = st.__sp;
+          			r.fp = st.__r[7];
+          			r.cpsr = st.__cpsr;
+          			dump_backtrace(fd, r, true);
+          		}
+          		else
+          		{
+          			ws(fd, "    (thread_get_state failed)\n");
+          		}
+
+          		thread_resume(threads[i]);
+          	}
+          }
+          #else
+          void dump_other_threads(int fd)
+          {
+          	ws(fd, "-- other threads: not implemented for this architecture --\n");
+          }
+          #endif
+
+          typedef void (*SectionFn)(int fd, const Regs& g, int sig);
+
+          void sec_backtrace_raw(int fd, const Regs& g, int)
+          {
+          	ws(fd, "-- backtrace (raw, use 'unslid' with the symbol list) --\n");
+          	dump_backtrace(fd, g, false);
+          }
+
+          void sec_backtrace_names(int fd, const Regs& g, int)
+          {
+          	ws(fd, "-- backtrace (dladdr names, may be empty for a stripped binary) --\n");
+          	dump_backtrace(fd, g, true);
+          }
+
+          void sec_fault_details(int fd, const Regs& g, int sig)
+          {
+          	ws(fd, "-- fault details --\n");
+
+          #if defined(__arm__)
+          	const bool thumb = (g.cpsr & 0x20u) != 0;
+          	ws(fd, "  execution state: ");
+          	ws(fd, thumb ? "THUMB" : "ARM");
+          	ws(fd, "\n");
+
+          	if (sig == SIGSEGV || sig == SIGBUS)
+          	{
+          		ws(fd, "  data fault: ");
+          		ws(fd, fsr_text(g.fsr));
+          		ws(fd, (g.fsr & 0x800u) != 0 ? " on a WRITE" : " on a READ");
+          		ws(fd, "\n");
+          	}
+          #else
+          	const bool thumb = false;
+          	static_cast<void>(sig);
+          #endif
+
+          	dump_region(fd, "region of fault address", g.far_addr);
+          	dump_region(fd, "region of pc", g.pc);
+          	dump_region(fd, "region of sp", g.sp);
+          	dump_code_bytes(fd, g.pc, thumb);
+          	dump_register_targets(fd, g);
+          	dump_stack_words(fd, g.sp);
+          }
+
+          void sec_threads(int fd, const Regs&, int)
+          {
+          	dump_other_threads(fd);
+          }
+
+          void sec_tail(int fd, const Regs&, int)
+          {
+          	dump_common_tail(fd);
+          }
+
+          // Runs one report section; a fault inside it (siglongjmp from the handler) only skips that section.
+          void run_section(int fd, const char* name, SectionFn fn, const Regs& g, int sig)
+          {
+          	if (sigsetjmp(g_guard_jmp, 1) == 0)
+          	{
+          		g_guard_armed = 1;
+          		fn(fd, g, sig);
+          		g_guard_armed = 0;
+          	}
+          	else
+          	{
+          		g_guard_armed = 0;
+          		ws(fd, "!! section '");
+          		ws(fd, name);
+          		ws(fd, "' faulted and was skipped\n");
+          	}
           }
 
           int open_crash_file()
@@ -2117,19 +2483,73 @@ jobs:
           	}
           }
 
+          void reset_to_default(int sig)
+          {
+          	struct sigaction dfl;
+          	memset(&dfl, 0, sizeof(dfl));
+          	sigemptyset(&dfl.sa_mask);
+          	dfl.sa_handler = SIG_DFL;
+          	sigaction(sig, &dfl, nullptr);
+          }
+
           void crash_signal_handler(int sig, siginfo_t* si, void* uctx)
           {
-          	if (g_in_crash != 0)
-          	{
-          		return; // SA_RESETHAND: default action on re-entry
-          	}
-
-          	g_in_crash = 1;
-
           	if (sig == SIGABRT && g_report_written != 0)
           	{
+          		reset_to_default(sig);
           		return; // std::terminate already wrote the full report
           	}
+
+          	if (!__sync_bool_compare_and_swap(&g_in_crash, 0, 1))
+          	{
+          		// Another fault while a report is being written.
+          		if (!pthread_equal(pthread_self(), g_crash_thread))
+          		{
+          			for (;;)
+          			{
+          				sleep(1); // a second thread crashed: wait for the first thread to finish its report
+          			}
+          		}
+
+          		const int fd2 = open_crash_file();
+          		Regs r;
+          		memset(&r, 0, sizeof(r));
+
+          		ws(fd2, "!! nested fault: signal ");
+          		wd(fd2, sig);
+
+          		if (get_regs(uctx, &r))
+          		{
+          			ws(fd2, " pc=");
+          			wh(fd2, r.pc);
+          			ws(fd2, " lr=");
+          			wh(fd2, r.lr);
+          			ws(fd2, " fault_addr=");
+          			wh(fd2, r.far_addr);
+          			ws(fd2, "\n");
+          			dump_frame(fd2, 0, r.pc, false);
+          		}
+          		else
+          		{
+          			ws(fd2, "\n");
+          		}
+
+          		if (fd2 > 2)
+          		{
+          			close(fd2);
+          		}
+
+          		if (g_guard_armed != 0)
+          		{
+          			g_guard_armed = 0;
+          			siglongjmp(g_guard_jmp, 1); // skip the faulting report section, keep the rest
+          		}
+
+          		reset_to_default(sig); // fault outside a guarded section: the next one is fatal
+          		return;
+          	}
+
+          	g_crash_thread = pthread_self();
 
           	const int fd = open_crash_file();
           	unlink(g_flag_path);
@@ -2141,14 +2561,16 @@ jobs:
           	wd(fd, sig);
           	ws(fd, " ");
           	ws(fd, signal_name(sig));
-          	ws(fd, "\ncode: ");
-          	wd(fd, si != nullptr ? si->si_code : 0);
-          	ws(fd, "  fault_addr: ");
-          	wh(fd, si != nullptr ? reinterpret_cast<uintptr_t>(si->si_addr) : 0);
           	ws(fd, "\nthread: ");
           	ws(fd, thread_label(pthread_self()));
           	ws(fd, " pthread=");
           	wh(fd, reinterpret_cast<uintptr_t>(pthread_self()));
+          	ws(fd, "\nhandler args: siginfo=");
+          	wh(fd, reinterpret_cast<uintptr_t>(si));
+          	ws(fd, " ucontext=");
+          	wh(fd, reinterpret_cast<uintptr_t>(uctx));
+          	ws(fd, " handler_sp=");
+          	wh(fd, reinterpret_cast<uintptr_t>(__builtin_frame_address(0)));
           	ws(fd, "\n");
 
           	Regs g;
@@ -2156,12 +2578,15 @@ jobs:
 
           	if (get_regs(uctx, &g))
           	{
-          		const uintptr_t fault = si != nullptr ? reinterpret_cast<uintptr_t>(si->si_addr) : 0;
-          		const pthread_t self = pthread_self();
-          		const uintptr_t top = reinterpret_cast<uintptr_t>(pthread_get_stackaddr_np(self));
-          		const uintptr_t low = top - static_cast<uintptr_t>(pthread_get_stacksize_np(self));
+          		const uintptr_t fault = g.far_addr;
 
-          		ws(fd, "diagnosis:");
+          		ws(fd, "cpu exception: fault_addr(FAR)=");
+          		wh(fd, fault);
+          		ws(fd, " fsr=");
+          		wh(fd, g.fsr);
+          		ws(fd, " exception=");
+          		wh(fd, g.exception);
+          		ws(fd, "\ndiagnosis:");
 
           		if (g.pc < 0x1000)
           		{
@@ -2174,9 +2599,13 @@ jobs:
           			wh(fd, fault);
           			ws(fd, ").");
           		}
-          		else if ((sig == SIGSEGV || sig == SIGBUS) && fault + (1u << 20) >= low && fault < low + 4096)
+          		else if (sig == SIGBUS && (g.pc & 1u) == 0 && (g.pc & 3u) != 0)
           		{
-          			ws(fd, " the fault address is next to the stack limit: stack overflow is likely.");
+          			ws(fd, " the program counter itself is misaligned: a jump to a bad address (corrupted function pointer / return address).");
+          		}
+          		else if (sig == SIGBUS)
+          		{
+          			ws(fd, " bus error: see 'fault details' below for the exact kind (alignment vs. unmapped).");
           		}
           		else if (sig == SIGILL)
           		{
@@ -2193,23 +2622,34 @@ jobs:
 
           		ws(fd, "\n");
           		dump_registers(fd, g);
-          		ws(fd, "-- backtrace (raw, use 'unslid' with the symbol list) --\n");
-          		dump_backtrace(fd, g, false);
-          		ws(fd, "-- backtrace (dladdr names, may be empty for a stripped binary) --\n");
-          		dump_backtrace(fd, g, true);
+
+          		run_section(fd, "backtrace(raw)", &sec_backtrace_raw, g, sig);
+          		run_section(fd, "fault-details", &sec_fault_details, g, sig);
+          		run_section(fd, "backtrace(dladdr)", &sec_backtrace_names, g, sig);
+          		run_section(fd, "other-threads", &sec_threads, g, sig);
+          		run_section(fd, "tail", &sec_tail, g, sig);
           	}
           	else
           	{
           		ws(fd, "(registers unavailable on this architecture)\n");
+          		run_section(fd, "tail", &sec_tail, g, sig);
           	}
 
-          	dump_common_tail(fd);
           	g_report_written = 1;
+
+          	// siginfo last: it is the part that faulted in the first version of this handler.
+          	ws(fd, "siginfo (read last): code=");
+          	wd(fd, si != nullptr ? si->si_code : 0);
+          	ws(fd, " addr=");
+          	wh(fd, si != nullptr ? reinterpret_cast<uintptr_t>(si->si_addr) : 0);
+          	ws(fd, "\n==== end of report ====\n");
 
           	if (fd > 2)
           	{
           		close(fd);
           	}
+
+          	reset_to_default(sig);
           }
 
           void bs_terminate_handler()
@@ -2262,7 +2702,9 @@ jobs:
           	ws(fd, "-- backtrace (dladdr names) --\n");
           	dump_backtrace(fd, g, true);
 
+          	dump_other_threads(fd);
           	dump_common_tail(fd);
+          	ws(fd, "==== end of report ====\n");
           	g_report_written = 1;
 
           	if (fd > 2)
@@ -2279,7 +2721,7 @@ jobs:
           	memset(&sa, 0, sizeof(sa));
           	sigemptyset(&sa.sa_mask);
           	sa.sa_sigaction = &crash_signal_handler;
-          	sa.sa_flags = SA_SIGINFO | SA_ONSTACK | SA_RESETHAND;
+          	sa.sa_flags = SA_SIGINFO | SA_ONSTACK | SA_NODEFER;
 
           	static const int signals[] = {SIGSEGV, SIGBUS, SIGILL, SIGFPE, SIGABRT, SIGTRAP, SIGSYS};
 
