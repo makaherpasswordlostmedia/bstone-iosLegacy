@@ -1,0 +1,1305 @@
+name: NFS 3DO -> iOS 7 armv7 (single-file build)
+
+# ONE file. Put it at .github/workflows/nfs-ios7.yml in YOUR FORK of pc-theneedforspeed (default branch), then Actions -> this workflow -> Run workflow. Nothing else to upload:
+# the host code, Makefile and plist are written by the "Write project" step below.
+# Your own disc: upload the ISO (2048-byte blocks, 327,980 blocks) to Google Drive,
+# sharing "Anyone with the link", and paste its file ID (or save secret DRIVE_ISO_ID).
+# No game data is ever committed or published; only the .ipa/.deb and diagnostics are uploaded.
+
+on:
+  workflow_dispatch:
+    inputs:
+      iso_file_id:
+        description: "Drive file ID of your NFS 3DO .iso (empty = secret DRIVE_ISO_ID)"
+        required: false
+        default: ""
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: NFS 3DO armv7 (Theos, iOS 7.0-9.3.5)
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    env:
+      WORK: ${{ github.workspace }}/work
+      NFS: ${{ github.workspace }}
+      P: ${{ github.workspace }}/work/proj
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Install host tools
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y build-essential perl curl ca-certificates zip unzip xz-utils bzip2 git fakeroot make python3 python3-pip python3-venv
+          mkdir -p "$WORK" "$P"
+          python3 -m venv "$WORK/venv"
+          "$WORK/venv/bin/pip" install -q gdown capstone
+
+      - name: Fetch your disc image from Google Drive
+        env:
+          ISO_ID: ${{ inputs.iso_file_id || secrets.DRIVE_ISO_ID }}
+        run: |
+          set -euo pipefail
+          [ -n "${ISO_ID:-}" ] || { echo "::error::No ISO ID. Fill iso_file_id or set secret DRIVE_ISO_ID."; exit 1; }
+          mkdir -p "$NFS/iso"
+          "$WORK/venv/bin/gdown" "$ISO_ID" -O "$NFS/iso/nfs.iso"
+          printf 'FILE "nfs.iso" BINARY\n  TRACK 01 MODE1/2048\n    INDEX 01 00:00:00\n' > "$NFS/iso/nfs.cue"
+          ls -la "$NFS/iso"
+
+      - name: Extract disc and recompile (3dokit, from the repo README)
+        working-directory: ${{ github.workspace }}
+        env:
+          PYTHONIOENCODING: utf-8
+        run: |
+          set -euo pipefail
+          PY="$WORK/venv/bin/python"
+          D=iso/nfs.cue
+          "$PY" -m 3dokit.disc "$D" --verify || true
+          "$PY" -m 3dokit.disc "$D" --extract build/disc
+          "$PY" -m 3dokit.recomp --out build/recomp --optest \
+            "launchme=build/disc/LaunchMe" "frontovl=build/disc/frontovl" \
+            "lmadm=build/disc/System/Programs/LMADM" "format=build/disc/System/Programs/FORMAT" 2>&1 | tee "$WORK/recomp.log"
+          ls build/recomp | head -50
+
+      # The app boots the EXTRACTED disc from Documents/disc/ on the device (nothing of the game is inside the .ipa).
+      # Download this artifact, unzip it and copy its contents into the app's Documents/disc/ (LaunchMe must end up
+      # at Documents/disc/LaunchMe). It is your own disc's data: the artifact is private to this repo, delete it when done.
+      - name: Upload extracted disc (copy into the app's Documents/disc/)
+        uses: actions/upload-artifact@v4
+        with:
+          name: NFS-disc-for-Documents-disc
+          path: ${{ github.workspace }}/build/disc
+          retention-days: 3
+          compression-level: 6
+          if-no-files-found: error
+
+      - name: Write project (host, Makefile, plist - all embedded in this file)
+        run: |
+          set -euo pipefail
+          mkdir -p "$(dirname "$P/host/nfs_host.h")"
+          cat > "$P/host/nfs_host.h" <<'NFS_EOF'
+          /* nfs_host.h - the seam between the pfboot core (3dokit-recompiled NFS + Portfolio runtime)
+           * and the iOS 7 / armv7 host. The core's SDL3 window/audio/pad layer is replaced by this.
+           * Plain C so it links from both the C++ core and the Objective-C host. */
+          #ifndef NFS_HOST_H
+          #define NFS_HOST_H
+          #include <stdint.h>
+          #include <stdbool.h>
+          #ifdef __cplusplus
+          extern "C" {
+          #endif
+
+          /* 3DO control pad bits (nfs_pad_state). In NFS: A = throttle, R = gear up. */
+          enum {  /* the runtime's own ControlPadEventData bits (pf_window.cpp), handed to pf_pad_live as is */
+              NFS_PAD_DOWN = 0x80000000u, NFS_PAD_UP = 0x40000000u, NFS_PAD_RIGHT = 0x20000000u, NFS_PAD_LEFT = 0x10000000u,
+              NFS_PAD_A = 0x08000000u, NFS_PAD_B = 0x04000000u, NFS_PAD_C = 0x02000000u, NFS_PAD_P = 0x01000000u, /* Play */
+              NFS_PAD_X = 0x00800000u, /* Stop */ NFS_PAD_R = 0x00400000u, NFS_PAD_L = 0x00200000u
+          };
+
+          /* ---- the core implements these (pfboot's main loop, wrapped in core/nfs_core_glue.cpp) ---- */
+          /* Boot the extracted disc tree (disc_dir holds LaunchMe, frontovl, ...) as the console does.
+           * Blocks until the game quits. nvram_dir is formatted by the disc's own FORMAT when blank. */
+          int  nfs_core_run(const char *disc_dir, const char *nvram_dir);
+          /* Mix `frames` stereo frames, interleaved s16, 44100 Hz. Called from the audio thread. */
+          void nfs_core_audio_mix(int16_t *out, int frames);
+
+          /* ---- the host owns these; the core reads them ---- */
+          extern volatile uint32_t nfs_pad_state;
+          extern volatile int      nfs_paused;      /* 1 while the app is inactive: the core must idle */
+
+          /* ---- the host implements these; the core calls them ---- */
+          /* One finished field: w x h (w = 320), 3 bytes a pixel, R G B (pf_display_field). */
+          void     nfs_host_present(const uint8_t *rgb, int w, int h);
+          uint64_t nfs_host_time_ns(void);
+          void     nfs_host_sleep_us(unsigned us);
+          void     nfs_host_log(const char *fmt, ...);
+          void     nfs_host_fatal(const char *msg);
+          /* render thread, once, when the app goes inactive: finish the queued GL work */
+          void     nfs_host_idle(void);
+
+          #ifdef __cplusplus
+          }
+          #endif
+          #endif
+          NFS_EOF
+          mkdir -p "$(dirname "$P/host/ios_host.m")"
+          cat > "$P/host/ios_host.m" <<'NFS_EOF'
+          /* ios_host.m - UIKit / EAGL (GLES2) / AudioQueue host for the NFS (3DO) core.
+           * iOS 7.0-9.3.5, armv7, ARC on. Structure from CrashBandicoot.Native/host/ios_host.m:
+           * the emulation thread owns GL, touch overlay, MFi pad, pause on resign-active. */
+          #import <UIKit/UIKit.h>
+          #import <QuartzCore/QuartzCore.h>
+          #import <OpenGLES/EAGL.h>
+          #import <OpenGLES/ES2/gl.h>
+          #import <OpenGLES/ES2/glext.h>
+          #import <AudioToolbox/AudioToolbox.h>
+          #import <AVFoundation/AVFoundation.h>
+          #import <GameController/GameController.h>
+          #include <stdarg.h>
+          #include <pthread.h>
+          #include <unistd.h>
+          #include <sys/stat.h>
+          #include <mach/mach_time.h>
+          #include "nfs_host.h"
+
+          volatile uint32_t nfs_pad_state;
+          volatile int nfs_paused;
+
+          /* ---------------------------------------------------------------- paths / log */
+          static char g_docs[512], g_disc[600], g_nvram[600], g_logpath[600];
+          static FILE *g_logf;
+          static pthread_mutex_t g_log_mx = PTHREAD_MUTEX_INITIALIZER;
+
+          void nfs_host_log(const char *fmt, ...)
+          {
+              pthread_mutex_lock(&g_log_mx);
+              if (!g_logf && g_logpath[0]) g_logf = fopen(g_logpath, "a");
+              va_list a; va_start(a, fmt);
+              if (g_logf) { vfprintf(g_logf, fmt, a); fputc('\n', g_logf); fflush(g_logf); }
+              va_end(a);
+              pthread_mutex_unlock(&g_log_mx);
+          }
+
+          uint64_t nfs_host_time_ns(void)
+          {
+              static mach_timebase_info_data_t tb;
+              if (tb.denom == 0) mach_timebase_info(&tb);
+              uint64_t t = mach_absolute_time();
+              return (tb.numer == tb.denom) ? t : t * tb.numer / tb.denom;
+          }
+          void nfs_host_sleep_us(unsigned us) { usleep(us); }
+
+          /* ---------------------------------------------------------------- pad */
+          static volatile uint32_t g_touch_mask, g_gc_mask;
+          static void pad_recompute(void) { nfs_pad_state = g_touch_mask | g_gc_mask; }
+
+          /* ---------------------------------------------------------------- GL (OpenGL ES 2.0) */
+          @interface GLView : UIView
+          @end
+          @implementation GLView
+          + (Class)layerClass { return [CAEAGLLayer class]; }
+          @end
+
+          static GLView *g_glview;
+          static EAGLContext *g_ctx;
+          static GLuint g_fbo, g_rbo, g_prog, g_tex, g_vbo;
+          static GLint g_vw, g_vh, g_u_isz, g_u_k;
+          static volatile int g_relayout = 1;      /* set on the main thread when the view's size changes; read by the render thread */
+
+          /* The field is 320 x (240 or so) RGB888. It lives in the corner of a 512 x 256 power-of-two texture
+           * (the PowerVR SGX of the iOS 7 devices likes those best); the vertex shader maps the quad onto that
+           * corner, the fragment shader shows it either plain bilinear or "sharp bilinear": texels stay crisp
+           * in the middle and blend only over about one screen pixel at their edges, so a 320-wide picture
+           * scaled 3x stays sharp without the blocky look of GL_NEAREST. */
+          #define TEX_W 512
+          #define TEX_H 256
+
+          static const char *VS =
+              "attribute vec2 p; attribute vec2 t; varying highp vec2 uv;"
+              "void main(){ uv = t; gl_Position = vec4(p, 0.0, 1.0); }";
+          static const char *FS_PLAIN =
+              "precision mediump float; varying highp vec2 uv; uniform sampler2D s;"
+              "uniform highp vec2 isz; uniform highp float k;"
+              "void main(){ gl_FragColor = vec4(texture2D(s, uv * isz / vec2(512.0, 256.0)).rgb, 1.0); }";
+          static const char *FS_SHARP =
+              "precision highp float; varying highp vec2 uv; uniform sampler2D s;"
+              "uniform vec2 isz; uniform float k;"
+              "void main(){"
+              "  vec2 texel = uv * isz;"
+              "  float range = 0.5 - 0.5 / k;"
+              "  vec2 d = fract(texel) - 0.5;"
+              "  vec2 f = (d - clamp(d, -range, range)) * k + 0.5;"
+              "  vec2 m = clamp(floor(texel) + f, vec2(0.5), isz - 0.5);"
+              "  gl_FragColor = vec4(texture2D(s, m / vec2(512.0, 256.0)).rgb, 1.0);"
+              "}";
+
+          static GLuint compile(GLenum type, const char *src)
+          {
+              GLuint s = glCreateShader(type);
+              glShaderSource(s, 1, &src, NULL); glCompileShader(s);
+              GLint ok = 0; glGetShaderiv(s, GL_COMPILE_STATUS, &ok);
+              if (!ok) { char b[512]; glGetShaderInfoLog(s, sizeof b, NULL, b); nfs_host_log("[GL] shader: %s", b); glDeleteShader(s); return 0; }
+              return s;
+          }
+
+          static GLuint link_program(const char *fs)
+          {
+              GLuint v = compile(GL_VERTEX_SHADER, VS), f = compile(GL_FRAGMENT_SHADER, fs);
+              if (!v || !f) return 0;
+              GLuint pr = glCreateProgram();
+              glAttachShader(pr, v); glAttachShader(pr, f);
+              glBindAttribLocation(pr, 0, "p"); glBindAttribLocation(pr, 1, "t");
+              glLinkProgram(pr);
+              glDeleteShader(v); glDeleteShader(f);
+              GLint ok = 0; glGetProgramiv(pr, GL_LINK_STATUS, &ok);
+              if (!ok) { char b[512]; glGetProgramInfoLog(pr, sizeof b, NULL, b); nfs_host_log("[GL] link: %s", b); glDeleteProgram(pr); return 0; }
+              return pr;
+          }
+
+          /* (re)bind the drawable and lay the 4:3 picture out in it: letterboxed, full screen on a 4:3 iPad */
+          static void gl_layout(void)
+          {
+              __block CAEAGLLayer *layer = nil;
+              dispatch_sync(dispatch_get_main_queue(), ^{ layer = (CAEAGLLayer *)g_glview.layer; });
+              glBindFramebuffer(GL_FRAMEBUFFER, g_fbo); glBindRenderbuffer(GL_RENDERBUFFER, g_rbo);
+              [g_ctx renderbufferStorage:GL_RENDERBUFFER fromDrawable:layer];
+              glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_RENDERBUFFER, g_rbo);
+              glGetRenderbufferParameteriv(GL_RENDERBUFFER, GL_RENDERBUFFER_WIDTH, &g_vw);
+              glGetRenderbufferParameteriv(GL_RENDERBUFFER, GL_RENDERBUFFER_HEIGHT, &g_vh);
+              float ar = (float)g_vw / (float)g_vh, sx = 1.f, sy = 1.f;
+              if (ar > 4.f / 3.f) sx = (4.f / 3.f) / ar; else sy = ar / (4.f / 3.f);
+              /* x y u v; v runs 0 at the top of the picture */
+              const float q[16] = { -sx,-sy, 0,1,   sx,-sy, 1,1,   -sx,sy, 0,0,   sx,sy, 1,0 };
+              glBindBuffer(GL_ARRAY_BUFFER, g_vbo);
+              glBufferData(GL_ARRAY_BUFFER, sizeof q, q, GL_STATIC_DRAW);
+              glEnableVertexAttribArray(0); glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, 16, (void *)0);
+              glEnableVertexAttribArray(1); glVertexAttribPointer(1, 2, GL_FLOAT, GL_FALSE, 16, (void *)8);
+              /* screen pixels per source texel across, for the sharp filter (1 = plain bilinear) */
+              float k = (sx * (float)g_vw * 0.5f) / 160.f; if (k < 1.f) k = 1.f;
+              glUniform1f(g_u_k, k);
+              glViewport(0, 0, g_vw, g_vh);
+              g_relayout = 0;
+              nfs_host_log("[GL] drawable %dx%d, %.2f px per texel", g_vw, g_vh, k);
+          }
+
+          static void gl_setup(void)
+          {
+              dispatch_sync(dispatch_get_main_queue(), ^{
+                  CAEAGLLayer *layer = (CAEAGLLayer *)g_glview.layer;
+                  layer.opaque = YES;
+                  layer.drawableProperties = @{ kEAGLDrawablePropertyRetainedBacking: @NO,
+                                                kEAGLDrawablePropertyColorFormat: kEAGLColorFormatRGB565 };
+              });
+              g_ctx = [[EAGLContext alloc] initWithAPI:kEAGLRenderingAPIOpenGLES2];
+              [EAGLContext setCurrentContext:g_ctx];
+              nfs_host_log("[GL] %s / %s", (const char *)glGetString(GL_RENDERER), (const char *)glGetString(GL_VERSION));
+
+              g_prog = link_program(FS_SHARP);
+              if (!g_prog) { nfs_host_log("[GL] sharp filter unavailable, plain bilinear"); g_prog = link_program(FS_PLAIN); }
+              if (!g_prog) nfs_host_fatal("GLES2 shaders failed (see nfs.log)");
+              glUseProgram(g_prog);
+              glUniform1i(glGetUniformLocation(g_prog, "s"), 0);
+              g_u_isz = glGetUniformLocation(g_prog, "isz");
+              g_u_k = glGetUniformLocation(g_prog, "k");
+
+              glGenFramebuffers(1, &g_fbo); glGenRenderbuffers(1, &g_rbo); glGenBuffers(1, &g_vbo);
+              gl_layout();
+
+              glActiveTexture(GL_TEXTURE0);
+              glGenTextures(1, &g_tex); glBindTexture(GL_TEXTURE_2D, g_tex);
+              glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+              glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+              glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+              glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+              glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
+              /* storage once, empty; every field after is a glTexSubImage2D of the rows it has */
+              glTexImage2D(GL_TEXTURE_2D, 0, GL_RGB, TEX_W, TEX_H, 0, GL_RGB, GL_UNSIGNED_BYTE, NULL);
+              glDisable(GL_DEPTH_TEST); glDisable(GL_BLEND); glDisable(GL_DITHER); glDisable(GL_CULL_FACE);
+              glClearColor(0, 0, 0, 1);
+          }
+
+          /* the app is going to the background: the GPU must have nothing queued (iOS ends an app that
+           * touches GL there); called by the render thread */
+          void nfs_host_idle(void)
+          {
+              if (g_ctx) { [EAGLContext setCurrentContext:g_ctx]; glFinish(); }
+          }
+
+          void nfs_host_present(const uint8_t *px, int w, int h)
+          {
+              if (nfs_paused) return;
+              if (!g_ctx) gl_setup();
+              [EAGLContext setCurrentContext:g_ctx];
+              if (g_relayout) gl_layout();
+              if (h > TEX_H) h = TEX_H;
+              if (w > TEX_W) w = TEX_W;
+              glBindFramebuffer(GL_FRAMEBUFFER, g_fbo);
+              glClear(GL_COLOR_BUFFER_BIT);                     /* the letterbox bars; a clear costs nothing on a tiled GPU */
+              glBindTexture(GL_TEXTURE_2D, g_tex);
+              glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, w, h, GL_RGB, GL_UNSIGNED_BYTE, px);
+              glUniform2f(g_u_isz, (GLfloat)w, (GLfloat)h);
+              glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
+              glBindRenderbuffer(GL_RENDERBUFFER, g_rbo);
+              [g_ctx presentRenderbuffer:GL_RENDERBUFFER];
+          }
+
+          /* ---------------------------------------------------------------- audio */
+          #define AUDIO_FRAMES 1024
+          static AudioQueueRef g_aq;
+          static void aq_cb(void *ud, AudioQueueRef q, AudioQueueBufferRef b)
+          {
+              nfs_core_audio_mix((int16_t *)b->mAudioData, AUDIO_FRAMES);
+              b->mAudioDataByteSize = AUDIO_FRAMES * 4;
+              AudioQueueEnqueueBuffer(q, b, 0, NULL);
+          }
+          static void audio_start(void)
+          {
+              [[AVAudioSession sharedInstance] setCategory:AVAudioSessionCategoryPlayback error:nil];
+              [[AVAudioSession sharedInstance] setActive:YES error:nil];
+              AudioStreamBasicDescription f = {0};
+              f.mSampleRate = 44100; f.mFormatID = kAudioFormatLinearPCM;
+              f.mFormatFlags = kAudioFormatFlagIsSignedInteger | kAudioFormatFlagIsPacked;
+              f.mBitsPerChannel = 16; f.mChannelsPerFrame = 2; f.mBytesPerFrame = 4;
+              f.mFramesPerPacket = 1; f.mBytesPerPacket = 4;
+              if (AudioQueueNewOutput(&f, aq_cb, NULL, NULL, NULL, 0, &g_aq) != noErr) { nfs_host_log("[AUDIO] failed"); return; }
+              for (int i = 0; i < 4; i++) {
+                  AudioQueueBufferRef b; AudioQueueAllocateBuffer(g_aq, AUDIO_FRAMES * 4, &b);
+                  memset(b->mAudioData, 0, AUDIO_FRAMES * 4); b->mAudioDataByteSize = AUDIO_FRAMES * 4;
+                  AudioQueueEnqueueBuffer(g_aq, b, 0, NULL);
+              }
+              AudioQueueStart(g_aq, NULL);
+          }
+
+          /* ---------------------------------------------------------------- touch overlay */
+          typedef struct { uint32_t mask; CGPoint c; CGFloat r; const char *label; } Btn;
+
+          @interface PadView : UIView
+          @end
+          @implementation PadView { Btn _b[8]; int _n; CGPoint _dp; CGFloat _dr; }
+          - (instancetype)initWithFrame:(CGRect)f
+          {
+              if ((self = [super initWithFrame:f])) {
+                  self.multipleTouchEnabled = YES; self.opaque = NO;
+                  self.backgroundColor = [UIColor clearColor];
+              }
+              return self;
+          }
+          /* Racing layout: steering pad left; gas (A) / brake (B) / C right; shift L/R on the top corners;
+           * Play (P) and Stop (X) bottom centre. */
+          - (void)layoutSubviews
+          {
+              CGFloat W = self.bounds.size.width, H = self.bounds.size.height, u = MIN(W, H) / 768.0;
+              _dp = CGPointMake(190 * u, H - 190 * u); _dr = 120 * u;
+              CGFloat fx = W - 190 * u;
+              _n = 0;
+              _b[_n++] = (Btn){ NFS_PAD_A, CGPointMake(fx + 60 * u, H - 230 * u), 62 * u, "A" };
+              _b[_n++] = (Btn){ NFS_PAD_B, CGPointMake(fx - 80 * u, H - 130 * u), 46 * u, "B" };
+              _b[_n++] = (Btn){ NFS_PAD_C, CGPointMake(fx - 90 * u, H - 270 * u), 40 * u, "C" };
+              _b[_n++] = (Btn){ NFS_PAD_L, CGPointMake(90 * u, 70 * u), 50 * u, "L" };
+              _b[_n++] = (Btn){ NFS_PAD_R, CGPointMake(W - 90 * u, 70 * u), 50 * u, "R" };
+              _b[_n++] = (Btn){ NFS_PAD_P, CGPointMake(W / 2 + 70 * u, H - 40 * u), 34 * u, "P" };
+              _b[_n++] = (Btn){ NFS_PAD_X, CGPointMake(W / 2 - 70 * u, H - 40 * u), 34 * u, "X" };
+              [self setNeedsDisplay];
+          }
+          - (void)drawRect:(CGRect)r
+          {
+              CGContextRef g = UIGraphicsGetCurrentContext();
+              CGContextSetRGBStrokeColor(g, 1, 1, 1, 0.45); CGContextSetRGBFillColor(g, 1, 1, 1, 0.10);
+              CGContextSetLineWidth(g, 2);
+              CGContextAddEllipseInRect(g, CGRectMake(_dp.x - _dr, _dp.y - _dr, _dr * 2, _dr * 2));
+              CGContextDrawPath(g, kCGPathFillStroke);
+              for (int i = 0; i < _n; i++) {
+                  CGContextAddEllipseInRect(g, CGRectMake(_b[i].c.x - _b[i].r, _b[i].c.y - _b[i].r, _b[i].r * 2, _b[i].r * 2));
+                  CGContextDrawPath(g, kCGPathFillStroke);
+                  NSString *s = [NSString stringWithUTF8String:_b[i].label];
+                  NSDictionary *at = @{ NSFontAttributeName: [UIFont boldSystemFontOfSize:MAX(12, _b[i].r * 0.55)],
+                                        NSForegroundColorAttributeName: [UIColor colorWithWhite:1 alpha:0.6] };
+                  CGSize z = [s sizeWithAttributes:at];
+                  [s drawAtPoint:CGPointMake(_b[i].c.x - z.width / 2, _b[i].c.y - z.height / 2) withAttributes:at];
+              }
+          }
+          - (void)recompute:(NSSet *)all
+          {
+              uint32_t m = 0;
+              for (UITouch *t in all) {
+                  if (t.phase == UITouchPhaseEnded || t.phase == UITouchPhaseCancelled) continue;
+                  CGPoint p = [t locationInView:self];
+                  CGFloat dx = p.x - _dp.x, dy = p.y - _dp.y, d = hypot(dx, dy);
+                  if (d < _dr * 1.3 && d > _dr * 0.15) {
+                      CGFloat a = atan2(dy, dx);
+                      if (cos(a) > 0.38) m |= NFS_PAD_RIGHT;
+                      if (cos(a) < -0.38) m |= NFS_PAD_LEFT;
+                      if (sin(a) > 0.38) m |= NFS_PAD_DOWN;
+                      if (sin(a) < -0.38) m |= NFS_PAD_UP;
+                  }
+                  for (int i = 0; i < _n; i++)
+                      if (hypot(p.x - _b[i].c.x, p.y - _b[i].c.y) <= _b[i].r * 1.25) m |= _b[i].mask;
+              }
+              g_touch_mask = m; pad_recompute();
+          }
+          - (void)touchesBegan:(NSSet *)t withEvent:(UIEvent *)e { [self recompute:[e allTouches]]; }
+          - (void)touchesMoved:(NSSet *)t withEvent:(UIEvent *)e { [self recompute:[e allTouches]]; }
+          - (void)touchesEnded:(NSSet *)t withEvent:(UIEvent *)e { [self recompute:[e allTouches]]; }
+          - (void)touchesCancelled:(NSSet *)t withEvent:(UIEvent *)e { [self recompute:[e allTouches]]; }
+          @end
+
+          /* ---------------------------------------------------------------- MFi pad */
+          static void gc_attach(GCController *c)
+          {
+              GCExtendedGamepad *x = c.extendedGamepad;
+              if (!x) return;
+              x.valueChangedHandler = ^(GCExtendedGamepad *p, GCControllerElement *el) {
+                  uint32_t m = 0;
+                  if (p.dpad.up.pressed) m |= NFS_PAD_UP;
+                  if (p.dpad.down.pressed) m |= NFS_PAD_DOWN;
+                  if (p.dpad.left.pressed || p.leftThumbstick.left.value > 0.4) m |= NFS_PAD_LEFT;
+                  if (p.dpad.right.pressed || p.leftThumbstick.right.value > 0.4) m |= NFS_PAD_RIGHT;
+                  if (p.buttonA.pressed || p.rightTrigger.value > 0.3) m |= NFS_PAD_A;   /* gas */
+                  if (p.buttonB.pressed || p.leftTrigger.value > 0.3) m |= NFS_PAD_B;    /* brake */
+                  if (p.buttonX.pressed) m |= NFS_PAD_C;
+                  if (p.buttonY.pressed) m |= NFS_PAD_P;
+                  if (p.leftShoulder.pressed) m |= NFS_PAD_L;
+                  if (p.rightShoulder.pressed) m |= NFS_PAD_R;
+                  g_gc_mask = m; pad_recompute();
+              };
+          }
+
+          /* ---------------------------------------------------------------- fatal */
+          void nfs_host_fatal(const char *msg)
+          {
+              nfs_host_log("[FATAL] %s", msg);
+              NSString *s = [NSString stringWithUTF8String:msg];
+              dispatch_async(dispatch_get_main_queue(), ^{
+                  UIAlertView *a = [[UIAlertView alloc] initWithTitle:@"Need for Speed" message:s delegate:nil
+                                                    cancelButtonTitle:@"OK" otherButtonTitles:nil];
+                  [a show];
+              });
+              nfs_paused = 1; if (g_aq) AudioQueuePause(g_aq);
+              for (;;) sleep(3600);
+          }
+
+          /* ---------------------------------------------------------------- app */
+          @interface RootVC : UIViewController
+          @end
+          @implementation RootVC
+          - (BOOL)prefersStatusBarHidden { return YES; }
+          - (NSUInteger)supportedInterfaceOrientations { return UIInterfaceOrientationMaskLandscape; }
+          - (BOOL)shouldAutorotate { return YES; }
+          - (void)viewDidLayoutSubviews { g_relayout = 1; }
+          - (void)loadView
+          {
+              CGRect b = [UIScreen mainScreen].bounds;
+              if (b.size.width < b.size.height) b = CGRectMake(0, 0, b.size.height, b.size.width);
+              UIView *root = [[UIView alloc] initWithFrame:b]; root.backgroundColor = [UIColor blackColor];
+              g_glview = [[GLView alloc] initWithFrame:b];
+              g_glview.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
+              [root addSubview:g_glview];
+              PadView *pad = [[PadView alloc] initWithFrame:b];
+              pad.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
+              [root addSubview:pad];
+              self.view = root;
+          }
+          @end
+
+          @interface AppDelegate : UIResponder <UIApplicationDelegate>
+          @property (strong, nonatomic) UIWindow *window;
+          @end
+          @implementation AppDelegate
+          - (void)emuMain:(id)arg
+          {
+              @autoreleasepool { audio_start(); }
+              int rc = nfs_core_run(g_disc, g_nvram);
+              nfs_host_fatal(rc ? "core stopped with an error (see nfs.log)" : "game returned");
+          }
+          - (BOOL)application:(UIApplication *)app didFinishLaunchingWithOptions:(NSDictionary *)opts
+          {
+              NSString *docs = NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES)[0];
+              snprintf(g_docs, sizeof g_docs, "%s", docs.UTF8String);
+              snprintf(g_disc, sizeof g_disc, "%s/disc", g_docs);       /* the extracted disc tree */
+              snprintf(g_nvram, sizeof g_nvram, "%s/nvram", g_docs);
+              snprintf(g_logpath, sizeof g_logpath, "%s/nfs.log", g_docs);
+              mkdir(g_nvram, 0755);
+
+              self.window = [[UIWindow alloc] initWithFrame:[UIScreen mainScreen].bounds];
+              self.window.rootViewController = [RootVC new];
+              [self.window makeKeyAndVisible];
+              app.idleTimerDisabled = YES;
+              [[NSNotificationCenter defaultCenter] addObserverForName:GCControllerDidConnectNotification object:nil
+                  queue:nil usingBlock:^(NSNotification *n) { gc_attach(n.object); }];
+              for (GCController *c in [GCController controllers]) gc_attach(c);
+
+              char probe[700]; snprintf(probe, sizeof probe, "%s/LaunchMe", g_disc);
+              if (access(probe, R_OK) != 0) {
+                  UILabel *l = [[UILabel alloc] initWithFrame:self.window.bounds];
+                  l.numberOfLines = 0; l.textAlignment = NSTextAlignmentCenter; l.textColor = [UIColor whiteColor];
+                  l.text = @"Put the extracted disc tree of your own\nThe Need for Speed (3DO) into\nDocuments/disc/ (LaunchMe, frontovl, ...)\nand relaunch.";
+                  [self.window.rootViewController.view addSubview:l];
+                  return YES;
+              }
+              nfs_host_log("---- launch, disc=%s", g_disc);
+              NSThread *t = [[NSThread alloc] initWithTarget:self selector:@selector(emuMain:) object:nil];
+              t.stackSize = 16 * 1024 * 1024; t.name = @"emu"; t.threadPriority = 1.0; [t start];
+              return YES;
+          }
+          - (void)applicationWillResignActive:(UIApplication *)a { nfs_paused = 1; if (g_aq) AudioQueuePause(g_aq); }
+          - (void)applicationDidBecomeActive:(UIApplication *)a { nfs_paused = 0; if (g_aq) AudioQueueStart(g_aq, NULL); }
+          @end
+
+          int main(int argc, char *argv[])
+          {
+              @autoreleasepool { return UIApplicationMain(argc, argv, nil, NSStringFromClass([AppDelegate class])); }
+          }
+          NFS_EOF
+          mkdir -p "$(dirname "$P/host/ios_availability_stub.m")"
+          cat > "$P/host/ios_availability_stub.m" <<'NFS_EOF'
+          /*
+           * ___isPlatformVersionAtLeast is a compiler-rt builtin clang emits for
+           * @available(...)/API_AVAILABLE checks. This toolchain's prebuilt
+           * libSDL2.a was compiled against a clang that assumes it's always
+           * present at link time (normally supplied by Apple's compiler-rt on a
+           * real Xcode toolchain), but this bare Linux->iOS cross-toolchain
+           * doesn't ship a compiler-rt archive at all - so the symbol is simply
+           * never linked in.
+           *
+           * Both call sites that need it (SDL_HideHomeIndicatorHintChanged and
+           * UIKit_ShowMessageBoxAlertController, both in SDL2's UIKit backend)
+           * only use it to guard iOS 11+/13+ API calls. Since this whole build
+           * targets iPhoneOS 9.3, any real OS this binary ever runs on that is
+           * newer than 9.3 should still report "yes, at least" for those
+           * checks correctly - so a full platform/version parser isn't needed,
+           * just something that answers consistently with the real runtime
+           * version already available via -[UIDevice systemVersion].
+           *
+           * Clang's ABI for this builtin (see clang/lib/CodeGen/CGObjC.cpp,
+           * EmitAvailabilityCheck): int32_t platform, then three components
+           * (major, minor, subminor) of the version being checked against.
+           * Returning 1 when the running OS's version >= the requested version
+           * matches real semantics; the SDL call sites already gate their own
+           * logic on this, so this stub just needs to answer correctly rather
+           * than unconditionally return true.
+           */
+          #import <UIKit/UIKit.h>
+
+          int32_t __isPlatformVersionAtLeast(int32_t platform, int32_t major, int32_t minor, int32_t subminor) {
+              (void)platform; /* single-platform (iOS) build; ignore platform id */
+
+              NSString *sysVersion = [[UIDevice currentDevice] systemVersion];
+              NSArray<NSString *> *parts = [sysVersion componentsSeparatedByString:@"."];
+
+              int32_t runningMajor = parts.count > 0 ? [parts[0] intValue] : 0;
+              int32_t runningMinor = parts.count > 1 ? [parts[1] intValue] : 0;
+              int32_t runningSubminor = parts.count > 2 ? [parts[2] intValue] : 0;
+
+              if (runningMajor != major) return runningMajor > major;
+              if (runningMinor != minor) return runningMinor > minor;
+              return runningSubminor >= subminor;
+          }
+          NFS_EOF
+          mkdir -p "$(dirname "$P/Makefile")"
+          cat > "$P/Makefile" <<'NFS_EOF'
+          # The Need for Speed (3DO) -> iOS 7.0-9.3.5, armv7 (32-bit). Theos project, same toolchain as
+          # CrashBandicoot.Native. Core = 3dokit-recompiled C++ + the Portfolio runtime (pfboot) WITHOUT its
+          # SDL3 front end; host/ios_host.m replaces that front end (see docs/PORTING.md).
+          export THEOS_DEVICE_IP =
+          ARCHS = armv7
+          TARGET = iphone:clang:9.3:7.0
+          INSTALL_TARGET_PROCESSES = NeedForSpeed3DO
+
+          include $(THEOS)/makefiles/common.mk
+          APPLICATION_NAME = NeedForSpeed3DO
+          TARGET_CXX += -std=c++20 -stdlib=libc++
+
+          # build/recomp/*.cpp     generated by `python -m 3dokit.recomp` from YOUR disc (never committed)
+          # core/*.cpp             3dokit's Portfolio runtime + pfboot core, copied from the 3dokit submodule
+          # core/nfs_core_glue.cpp wraps pfboot's main loop as nfs_core_run / nfs_core_audio_mix
+          NeedForSpeed3DO_FILES = $(wildcard build/recomp/*.cpp) $(wildcard core/*.cpp) \
+          	host/ios_host.m host/ios_availability_stub.m
+          NeedForSpeed3DO_OBJCFLAGS = -fobjc-arc -std=gnu11
+
+          # The runtime is C++20 (recomp CMakeLists). The 9.3 SDK ships an OLD libc++ - the first Theos build will
+          # show which library features break; thread_local needs iOS 9+, aligned new iOS 11+.
+          ADDITIONAL_CFLAGS += -fno-modules -fno-implicit-modules -fno-implicit-module-maps \
+          	-Wno-deprecated-declarations -Wno-unused-label -Wno-unused-variable -Wno-unused-function \
+          	-Wno-unused-parameter -Wno-error -Wno-missing-braces -Wno-unknown-warning-option -fno-strict-aliasing \
+          	-fno-stack-protector -fomit-frame-pointer -ffunction-sections -fdata-sections -mfpu=neon
+          NeedForSpeed3DO_CCFLAGS = -std=c++20 -stdlib=libc++ -DNFS_IOS7=1
+          NeedForSpeed3DO_CXXFLAGS = -std=c++20 -stdlib=libc++ -DNFS_IOS7=1
+          NeedForSpeed3DO_CFLAGS = -I$(CURDIR)/host -I$(CURDIR)/core -I$(CURDIR)/build/recomp -DNDEBUG
+
+          # hot paths (cel projector, DSP interpreter) at -O3; the huge generated code stays at the default level
+          core/pf_cel.cpp_CXXFLAGS += -O3
+          core/pf_dsp.cpp_CXXFLAGS += -O3
+          core/pf_graphics.cpp_CXXFLAGS += -O3
+          core/pf_mem.cpp_CXXFLAGS += -O3
+          core/pf_os.cpp_CXXFLAGS += -O2
+
+          NeedForSpeed3DO_LDFLAGS = -framework UIKit -framework Foundation -framework QuartzCore \
+          	-framework CoreGraphics -framework OpenGLES -framework AudioToolbox -framework AVFoundation \
+          	-weak_framework GameController -lc++ -Wl,-dead_strip
+          NeedForSpeed3DO_CODESIGN_FLAGS = -SResources/entitlements.plist
+          NeedForSpeed3DO_PLIST = Resources/Info.plist
+
+          include $(THEOS_MAKE_PATH)/application.mk
+          NFS_EOF
+          mkdir -p "$(dirname "$P/Resources/Info.plist")"
+          cat > "$P/Resources/Info.plist" <<'NFS_EOF'
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0">
+          <dict>
+          	<key>CFBundleDevelopmentRegion</key><string>en</string>
+          	<key>CFBundleExecutable</key><string>NeedForSpeed3DO</string>
+          	<key>CFBundleIdentifier</key><string>com.example.nfs3do.armv7</string>
+          	<key>CFBundleInfoDictionaryVersion</key><string>6.0</string>
+          	<key>CFBundleName</key><string>NFS 3DO</string>
+          	<key>CFBundleDisplayName</key><string>NFS 3DO</string>
+          	<key>CFBundlePackageType</key><string>APPL</string>
+          	<key>CFBundleShortVersionString</key><string>0.1.0</string>
+          	<key>CFBundleVersion</key><string>1</string>
+          	<key>MinimumOSVersion</key><string>7.0</string>
+          	<key>UIRequiredDeviceCapabilities</key><array><string>armv7</string><string>opengles-2</string></array>
+          	<key>LSRequiresIPhoneOS</key><true/>
+          	<key>UIDeviceFamily</key><array><integer>2</integer><integer>1</integer></array>
+          	<key>UISupportedInterfaceOrientations</key>
+          	<array><string>UIInterfaceOrientationLandscapeLeft</string><string>UIInterfaceOrientationLandscapeRight</string></array>
+          	<key>UISupportedInterfaceOrientations~ipad</key>
+          	<array><string>UIInterfaceOrientationLandscapeLeft</string><string>UIInterfaceOrientationLandscapeRight</string></array>
+          	<key>UIStatusBarHidden</key><true/>
+          	<key>UIViewControllerBasedStatusBarAppearance</key><false/>
+          	<key>UIRequiresFullScreen</key><true/>
+          	<key>UIFileSharingEnabled</key><true/>
+          	<key>UIBackgroundModes</key><array/>
+          </dict>
+          </plist>
+          NFS_EOF
+          mkdir -p "$(dirname "$P/Resources/entitlements.plist")"
+          cat > "$P/Resources/entitlements.plist" <<'NFS_EOF'
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0">
+          <dict>
+          	<key>get-task-allow</key>
+          	<true/>
+          </dict>
+          </plist>
+          NFS_EOF
+          mkdir -p "$(dirname "$P/core/nfs_core_glue.cpp")"
+          cat > "$P/core/nfs_core_glue.cpp" <<'NFS_EOF'
+          // nfs_core_glue.cpp - the iOS stand-in for 3dokit/runtime/pf_window.cpp (SDL3), and the two
+          // entry points host/ios_host.m calls. pf_main.cpp is built with -Dmain=pf_boot_main -DTDK_WINDOW=1,
+          // so `pfboot DISC --boot --window` ends up in pf_window_run() below instead of SDL.
+          //   video: the program's thread hands a field over at each vertical blank; a render thread
+          //          (the only one that touches GL) shows the latest one through nfs_host_present().
+          //   audio: pf_dsp pushes frames at the rate they play (g_pf_audio_out); the AudioQueue pulls them
+          //          from a ring in nfs_core_audio_mix().
+          //   pad:   nfs_pad_state holds the runtime's own button bits; handed to pf_pad_live every field.
+          #include "pf.h"
+          #include "nfs_host.h"
+          #include <atomic>
+          #include <chrono>
+          #include <condition_variable>
+          #include <functional>
+          #include <mutex>
+          #include <string>
+          #include <thread>
+          #include <vector>
+
+          extern int pf_boot_main(int argc, char** argv);      // pf_main.cpp's main()
+
+          namespace {
+
+          // ---- audio ring: one producer (the program), one consumer (the AudioQueue) ----
+          constexpr size_t kRing = 1u << 15;                   // stereo frames, power of two
+          int16_t g_ring[kRing * 2];
+          std::atomic<size_t> g_w{0}, g_r{0};                  // free-running frame counters
+          bool g_primed;
+
+          void window_audio(const int16_t* lr, size_t frames) {
+              if (!g_primed) { g_primed = true; g_w.store(2646); }   // 60 ms of silence as the margin, as the SDL window did
+              size_t w = g_w.load(std::memory_order_relaxed), r = g_r.load(std::memory_order_acquire);
+              if (w - r > 44100 / 2 || w - r + frames > kRing) return;   // half a second queued: drop, the SDL window cleared its queue
+              for (size_t i = 0; i < frames; ++i) {
+                  size_t k = (w + i) & (kRing - 1);
+                  g_ring[k * 2] = lr[i * 2];
+                  g_ring[k * 2 + 1] = lr[i * 2 + 1];
+              }
+              g_w.store(w + frames, std::memory_order_release);
+          }
+
+          // ---- video: the latest field, and the pace ----
+          std::mutex g_lock;
+          std::condition_variable g_cv;
+          std::vector<uint8_t> g_rgb;                          // the latest field; swapped, never copied
+          int g_lines;
+          uint64_t g_seq;
+          std::atomic<bool> g_stop{false};
+
+          using Clock = std::chrono::steady_clock;
+          Clock::time_point g_host0;
+          uint64_t g_guest0;
+          bool g_started;
+
+          // The program's thread, at each vertical blank (pf_window.cpp's window_vbl).
+          void window_vbl(uint64_t when) {
+              static std::vector<uint8_t> work;                // kept between fields: no allocation after the first
+              int lines;
+              if (pf_display_field(work, lines)) {
+                  {
+                      std::lock_guard<std::mutex> l(g_lock);
+                      g_rgb.swap(work);
+                      g_lines = lines;
+                      ++g_seq;
+                  }
+                  g_cv.notify_one();
+              }
+              pf_pad_live(nfs_pad_state);
+              if (nfs_paused) {                                // backgrounded: hold the guest, count the clock again after
+                  while (nfs_paused) nfs_host_sleep_us(10000);
+                  g_started = false;
+              }
+              Clock::time_point now = Clock::now();
+              if (!g_started) {
+                  g_started = true;
+                  g_host0 = now;
+                  g_guest0 = when;
+                  return;
+              }
+              Clock::time_point due = g_host0 + std::chrono::nanoseconds(when - g_guest0);
+              if (due > now) std::this_thread::sleep_until(due);
+              else if (now - due > std::chrono::milliseconds(100)) {   // fell behind: count again from here
+                  g_host0 = now;
+                  g_guest0 = when;
+              }
+          }
+
+          // The only thread that touches GL. Wakes when a field is ready (no polling); the present itself
+          // waits for the display's vertical sync, so a slow GPU drops fields instead of queueing them.
+          void render_loop() {
+              std::vector<uint8_t> rgb;
+              uint64_t shown = 0;
+              bool idle = false;
+              while (!g_stop) {
+                  int lines = 0;
+                  {
+                      std::unique_lock<std::mutex> l(g_lock);
+                      g_cv.wait_for(l, std::chrono::milliseconds(50), [&] { return g_seq != shown || g_stop; });
+                      if (g_seq != shown) { shown = g_seq; rgb.swap(g_rgb); lines = g_lines; }
+                  }
+                  if (nfs_paused) {
+                      if (!idle) { nfs_host_idle(); idle = true; }
+                      continue;
+                  }
+                  idle = false;
+                  if (lines) nfs_host_present(rgb.data(), 320, lines);
+              }
+          }
+
+          }  // namespace
+
+          // pf_main.cpp calls this (TDK_WINDOW) with the program's boot and run in `run`.
+          int pf_window_run(const char* title, const char* record, const std::function<int()>& run) {
+              (void)title; (void)record;                       // no --record on iOS
+              g_pf_audio_out = window_audio;
+              g_pf_display_vbl = window_vbl;
+              g_pf_wait_forever = true;
+              std::thread render(render_loop);
+              int r = run();
+              g_stop = true;
+              render.join();
+              return r;
+          }
+
+          extern "C" int nfs_core_run(const char* disc_dir, const char* nvram_dir) {
+              std::string d(disc_dir), n(nvram_dir);
+              std::vector<char*> a = { (char*)"pfboot", &d[0], (char*)"--boot", (char*)"--trace", (char*)"0",
+                                       (char*)"--nvram", &n[0], (char*)"--window" };
+              return pf_boot_main((int)a.size(), a.data());
+          }
+
+          extern "C" void nfs_core_audio_mix(int16_t* out, int frames) {
+              size_t r = g_r.load(std::memory_order_relaxed), w = g_w.load(std::memory_order_acquire);
+              size_t n = w - r < (size_t)frames ? w - r : (size_t)frames;
+              for (size_t i = 0; i < n; ++i) {
+                  size_t k = (r + i) & (kRing - 1);
+                  out[i * 2] = g_ring[k * 2];
+                  out[i * 2 + 1] = g_ring[k * 2 + 1];
+              }
+              for (size_t i = n * 2; i < (size_t)frames * 2; ++i) out[i] = 0;
+              g_r.store(r + n, std::memory_order_release);
+          }
+          NFS_EOF
+          cat > "$P/core/fstream_inst.cpp" <<'NFS_EOF'
+          // fstream_inst.cpp - the toolchain's modern <fstream> declares basic_filebuf/ifstream/ofstream<char> as
+          // `extern template`, expecting the dylib to define them. The iOS 7-9.3 libc++.dylib does not export these
+          // (link error: basic_filebuf::open / ctor / dtor, ifstream/ofstream vtable + VTT), so instantiate them here.
+          #include <fstream>
+          template class std::basic_filebuf<char>;
+          template class std::basic_ifstream<char>;
+          template class std::basic_ofstream<char>;
+          NFS_EOF
+          cat > "$P/core/fs_shim.h" <<'NFS_EOF'
+          // fs_shim.h - the slice of std::filesystem that pf_file.cpp uses, over POSIX.
+          // iOS 7's libc++.dylib has no filesystem library and the toolchain has none for armv7.
+          #pragma once
+          #include <cstdint>
+          #include <iterator>
+          #include <memory>
+          #include <string>
+          #include <system_error>
+          #include <dirent.h>
+          #include <sys/stat.h>
+
+          namespace fsshim {
+
+          class path {
+              std::string s_;
+          public:
+              path() = default;
+              path(const std::string& s) : s_(s) {}
+              path(const char* s) : s_(s) {}
+              const std::string& string() const { return s_; }
+              const std::string& native() const { return s_; }
+              std::string generic_string() const { return s_; }
+              const char* c_str() const { return s_.c_str(); }
+              operator std::string() const { return s_; }
+              bool empty() const { return s_.empty(); }
+              path filename() const { size_t p = s_.find_last_of('/'); return path(p == std::string::npos ? s_ : s_.substr(p + 1)); }
+              path parent_path() const { size_t p = s_.find_last_of('/'); return path(p == std::string::npos ? std::string() : s_.substr(0, p)); }
+              path extension() const { std::string f = filename().s_; size_t p = f.find_last_of('.'); return path(p == std::string::npos || p == 0 ? std::string() : f.substr(p)); }
+              path stem() const { std::string f = filename().s_; size_t p = f.find_last_of('.'); return path(p == std::string::npos || p == 0 ? f : f.substr(0, p)); }
+              path& operator/=(const path& o) {
+                  if (o.s_.empty()) return *this;
+                  if (o.s_[0] == '/') { s_ = o.s_; return *this; }
+                  if (!s_.empty() && s_.back() != '/') s_ += '/';
+                  s_ += o.s_;
+                  return *this;
+              }
+              friend path operator/(path a, const path& b) { a /= b; return a; }
+              friend bool operator==(const path& a, const path& b) { return a.s_ == b.s_; }
+              friend bool operator!=(const path& a, const path& b) { return a.s_ != b.s_; }
+              friend bool operator<(const path& a, const path& b) { return a.s_ < b.s_; }
+          };
+
+          class filesystem_error : public std::system_error {
+              path p_;
+          public:
+              filesystem_error(const std::string& what, const path& p, std::error_code ec) : std::system_error(ec, what), p_(p) {}
+              const path& path1() const { return p_; }
+          };
+
+          enum class file_type { none, not_found, regular, directory, symlink, unknown };
+          class file_status {
+              file_type t_;
+          public:
+              explicit file_status(file_type t = file_type::none) : t_(t) {}
+              file_type type() const { return t_; }
+          };
+
+          inline file_status status(const path& p) {
+              struct stat st;
+              if (::stat(p.c_str(), &st) != 0) return file_status(file_type::not_found);
+              return file_status(S_ISDIR(st.st_mode) ? file_type::directory : S_ISREG(st.st_mode) ? file_type::regular : file_type::unknown);
+          }
+          inline file_status status(const path& p, std::error_code& ec) { ec.clear(); return status(p); }
+          inline bool is_directory(const file_status& s) { return s.type() == file_type::directory; }
+          inline bool is_regular_file(const file_status& s) { return s.type() == file_type::regular; }
+          inline bool exists(const file_status& s) { return s.type() != file_type::none && s.type() != file_type::not_found; }
+          inline bool is_directory(const path& p) { return is_directory(status(p)); }
+          inline bool is_directory(const path& p, std::error_code& ec) { return is_directory(status(p, ec)); }
+          inline bool is_regular_file(const path& p) { return is_regular_file(status(p)); }
+          inline bool is_regular_file(const path& p, std::error_code& ec) { return is_regular_file(status(p, ec)); }
+          inline bool exists(const path& p) { return exists(status(p)); }
+          inline bool exists(const path& p, std::error_code& ec) { return exists(status(p, ec)); }
+
+          inline std::uintmax_t file_size(const path& p, std::error_code& ec) {
+              struct stat st;
+              if (::stat(p.c_str(), &st) != 0) { ec = std::error_code(errno, std::generic_category()); return static_cast<std::uintmax_t>(-1); }
+              ec.clear();
+              return static_cast<std::uintmax_t>(st.st_size);
+          }
+          inline std::uintmax_t file_size(const path& p) {
+              std::error_code ec;
+              std::uintmax_t n = file_size(p, ec);
+              if (ec) throw filesystem_error("file_size", p, ec);
+              return n;
+          }
+
+          class directory_entry {
+              fsshim::path p_;
+          public:
+              directory_entry() = default;
+              explicit directory_entry(const fsshim::path& p) : p_(p) {}
+              const fsshim::path& path() const { return p_; }
+              operator const fsshim::path&() const { return p_; }
+              file_status status() const { return fsshim::status(p_); }
+              bool is_directory() const { return fsshim::is_directory(p_); }
+              bool is_regular_file() const { return fsshim::is_regular_file(p_); }
+              bool exists() const { return fsshim::exists(p_); }
+              std::uintmax_t file_size() const { return fsshim::file_size(p_); }
+          };
+
+          class directory_iterator {
+              struct State {
+                  DIR* d = nullptr;
+                  fsshim::path dir;
+                  directory_entry cur;
+                  ~State() { if (d) ::closedir(d); }
+              };
+              std::shared_ptr<State> st_;
+              void advance() {
+                  while (struct dirent* e = ::readdir(st_->d)) {
+                      std::string n = e->d_name;
+                      if (n == "." || n == "..") continue;
+                      st_->cur = directory_entry(st_->dir / n);
+                      return;
+                  }
+                  st_.reset();
+              }
+              void open(const path& p, std::error_code& ec) {
+                  DIR* d = ::opendir(p.c_str());
+                  if (!d) { ec = std::error_code(errno, std::generic_category()); return; }
+                  ec.clear();
+                  st_ = std::make_shared<State>();
+                  st_->d = d;
+                  st_->dir = p;
+                  advance();
+              }
+          public:
+              using iterator_category = std::input_iterator_tag;
+              using value_type = directory_entry;
+              using difference_type = std::ptrdiff_t;
+              using pointer = const directory_entry*;
+              using reference = const directory_entry&;
+              directory_iterator() = default;
+              explicit directory_iterator(const path& p) { std::error_code ec; open(p, ec); if (ec) throw filesystem_error("directory_iterator", p, ec); }
+              directory_iterator(const path& p, std::error_code& ec) { open(p, ec); }
+              const directory_entry& operator*() const { return st_->cur; }
+              const directory_entry* operator->() const { return &st_->cur; }
+              directory_iterator& operator++() { advance(); return *this; }
+              directory_iterator& increment(std::error_code& ec) { ec.clear(); advance(); return *this; }
+              directory_iterator operator++(int) { directory_iterator t = *this; advance(); return t; }
+              friend bool operator==(const directory_iterator& a, const directory_iterator& b) { return a.st_ == b.st_; }
+              friend bool operator!=(const directory_iterator& a, const directory_iterator& b) { return a.st_ != b.st_; }
+          };
+          inline directory_iterator begin(directory_iterator it) { return it; }
+          inline directory_iterator end(const directory_iterator&) { return directory_iterator(); }
+
+          }  // namespace fsshim
+          NFS_EOF
+          cat > "$P/control" <<'CTL'
+          Package: com.example.nfs3do.armv7
+          Name: NFS 3DO
+          Version: 0.1.0
+          Architecture: iphoneos-arm
+          Description: The Need for Speed (3DO), static recompilation, iOS 7 armv7
+          Maintainer: local
+          Author: local
+          Section: Games
+          CTL
+          ls -R "$P"
+
+      - name: Apply speed patches to 3dokit's runtime (cel engine, field conversion)
+        working-directory: ${{ github.workspace }}
+        run: |
+          set -euo pipefail
+          # bit-exact (checked against the original on random CCB lists): rectangle fast path,
+          # no frame-buffer read when the pixel processor ignores it, direct VRAM access, row-wise field conversion
+          cat > "$WORK/nfs-perf.patch" <<'PERF_EOF'
+          diff -u -r a/3dokit/runtime/pf_cel.cpp b/3dokit/runtime/pf_cel.cpp
+          --- a/3dokit/runtime/pf_cel.cpp	2026-11-25 22:09:01.243552891 +0000
+          +++ b/3dokit/runtime/pf_cel.cpp	2026-11-25 22:09:01.245160103 +0000
+          @@ -15,6 +15,8 @@
+           #include <cstdio>
+           #include <utility>
+ 
+          +#define ARM_LIKELY_IN(a) (__builtin_expect((a) + 4u <= ARM_MEM_SIZE, 1))
+          +
+           namespace {
+ 
+           enum : uint32_t {
+          @@ -49,7 +51,8 @@
+           // say: 0 here. Immercenary's full-screen LRFORM cels count 240 pairs (as Opera reads VCNT for
+           // LRFORM, the 3D view's 240 lines twice over), so their last 120 pairs run past VRAM's end -- rows
+           // that land below the clip and are never seen.
+          -uint32_t src_word(uint32_t a) {
+          +inline uint32_t src_word(uint32_t a) {
+          +    if (ARM_LIKELY_IN(a)) return ld32(a);
+               if (a + 4 > ARM_MEM_SIZE && a < PF_OS_BASE) {
+                   static bool told;
+                   if (!told && g_pf_trace) pf_log("        (the cel engine reads source data past VRAM, at %08X: 0)\n", a);
+          @@ -63,6 +66,12 @@
+           struct Bits {
+               uint32_t base, pos = 0;
+               uint32_t take(unsigned n) {
+          +        uint32_t off = pos & 31;
+          +        if (off + n <= 32) {                    // the common case: inside one word
+          +            uint32_t w = src_word(base + (pos >> 5) * 4);
+          +            pos += n;
+          +            return (w >> (32 - off - n)) & (n == 32 ? 0xFFFFFFFFu : ((1u << n) - 1));
+          +        }
+                   uint32_t v = 0;
+                   while (n) {
+                       uint32_t w = src_word(base + (pos >> 5) * 4), have = 32 - (pos & 31), k = n < have ? n : have;
+          @@ -84,12 +93,19 @@
+           uint32_t fb_addr(uint32_t base, uint32_t width, int32_t x, int32_t y) {
+               return base + ((uint32_t)(y >> 1) * width + (uint32_t)x) * 4;
+           }
+          -uint32_t fb_read(uint32_t base, uint32_t width, int32_t x, int32_t y) {
+          -    uint32_t w = pf_r32(fb_addr(base, width, x, y));
+          +inline uint32_t fb_read(uint32_t base, uint32_t width, int32_t x, int32_t y) {
+          +    uint32_t a = fb_addr(base, width, x, y);
+          +    uint32_t w = ARM_LIKELY_IN(a) ? ld32(a) : pf_r32(a);
+               return y & 1 ? w & 0xFFFF : w >> 16;
+           }
+          -void fb_write(uint32_t base, uint32_t width, int32_t x, int32_t y, uint32_t v) {
+          -    uint32_t a = fb_addr(base, width, x, y), w = pf_r32(a);
+          +inline void fb_write(uint32_t base, uint32_t width, int32_t x, int32_t y, uint32_t v) {
+          +    uint32_t a = fb_addr(base, width, x, y);
+          +    if (ARM_LIKELY_IN(a)) {
+          +        uint32_t w = ld32(a);
+          +        st32(a, y & 1 ? (w & 0xFFFF0000u) | v : (w & 0xFFFFu) | v << 16);
+          +        return;
+          +    }
+          +    uint32_t w = pf_r32(a);
+               pf_w32(a, y & 1 ? (w & 0xFFFF0000u) | v : (w & 0xFFFFu) | v << 16);
+           }
+ 
+          @@ -158,6 +174,7 @@
+           // plus one, sign-extended after that; the sum halved by 2D. Opera adds in 8 bits, so a large
+           // primary wraps negative there; here the sum is held within 0 to 31 whatever its size.
+           uint32_t ppmp(ArmCpu& c, uint32_t mode, uint32_t pix, uint32_t fb, uint32_t amv, uint32_t flags) {
+          +    if ((mode & 0xFFC1u) == 0x1F00u && !(flags & (CCB_USEAV | CCB_PXOR))) return pix & 0x7FFFu;   // x8 >> 3, nothing added: the colour as it is
+               uint32_t s1 = mode >> 15 & 1, ms = mode >> 13 & 3, mf = mode >> 10 & 7, df = mode >> 8 & 3,
+                        s2 = mode >> 6 & 3, av = mode >> 1 & 31, d2 = mode & 1;
+               bool useav = flags & CCB_USEAV, pxor = flags & CCB_PXOR;
+          @@ -331,12 +348,31 @@
+                   if (!(dec & 0x7FFF) && !(cel.flags & CCB_BGND)) return;     // transparent, before the LSB
+                   uint32_t pix = blue_lsb(dec, lsb);
+                   uint32_t pm = pover == 2 ? 0 : pover == 3 ? 1 : pix >> 15;
+          -        fill_quad(qx, qy, cel.flags, [&](int32_t x, int32_t y) {
+          -            if (x < 0 || x > t.xclip || y < 0 || y > t.yclip) return;
+          -            uint32_t fb = blue_lsb(fb_read(t.read, t.width, x, y), cec >> 22 & 3);
+          -            uint32_t pp = ppmp(c, pm ? g_ce.pixc >> 16 : g_ce.pixc & 0xFFFF, pix, fb, amv, cel.flags);
+          +        const uint32_t mode = pm ? g_ce.pixc >> 16 : g_ce.pixc & 0xFFFF;
+          +        const bool needfb = (mode & 0x8000u) || (mode >> 6 & 3) == 2;       // the frame buffer pixel is a source of the pixel processor
+          +        auto plot = [&](int32_t x, int32_t y) {                              // inside the clip
+          +            uint32_t fb = needfb ? blue_lsb(fb_read(t.read, t.width, x, y), cec >> 22 & 3) : 0;
+          +            uint32_t pp = ppmp(c, mode, pix, fb, amv, cel.flags);
+                       if (!(pp & 0x7FFF) && !(cel.flags & CCB_NOBLK)) pp = 1 << 10;   // black is written as red 1
+                       fb_write(t.write, t.width, x, y, vh_out(dec, pp));
+          +        };
+          +        // An upright rectangle (no turn, no bend: the usual cel) is fill_quad's walk in closed form:
+          +        // its two vertical edges, the one more to the left first, painted when the flag of the way
+          +        // that edge goes allows it; clipped once instead of at every pixel.
+          +        const int32_t x0 = qx[0] >> 16, x1 = qx[1] >> 16, y0 = qy[0] >> 16, y3 = qy[3] >> 16;
+          +        if (x0 == qx[3] >> 16 && x1 == qx[2] >> 16 && y0 == qy[1] >> 16 && y3 == qy[2] >> 16) {
+          +            if (x0 == x1 || y0 == y3) return;
+          +            bool down_first = x1 < x0 ? y3 > y0 : y0 > y3;                  // the left edge's way
+          +            if (!(cel.flags & (down_first ? CCB_ACCW : CCB_ACW))) return;
+          +            int32_t xa = std::max(std::min(x0, x1), 0), xb = std::min(std::max(x0, x1) - 1, t.xclip);
+          +            int32_t ya = std::max(std::min(y0, y3), 0), yb = std::min(std::max(y0, y3) - 1, t.yclip);
+          +            for (int32_t y = ya; y <= yb; ++y)
+          +                for (int32_t x = xa; x <= xb; ++x) plot(x, y);
+          +            return;
+          +        }
+          +        fill_quad(qx, qy, cel.flags, [&](int32_t x, int32_t y) {
+          +            if (x < 0 || x > t.xclip || y < 0 || y > t.yclip) return;
+          +            plot(x, y);
+                   });
+               };
+ 
+          diff -u -r a/3dokit/runtime/pf_graphics.cpp b/3dokit/runtime/pf_graphics.cpp
+          --- a/3dokit/runtime/pf_graphics.cpp	2026-11-25 22:09:01.247759661 +0000
+          +++ b/3dokit/runtime/pf_graphics.cpp	2026-11-25 22:09:01.250569566 +0000
+          @@ -110,7 +110,7 @@
+               uint8_t clut[32][3] = {};
+               uint32_t cur = 0;
+               bool odd = false, picture = false;
+          -    rgb.clear();
+          +    rgb.resize(512u * 960u);                                // the most lines a field has; cut to size at the end
+               lines = 0;
+               for (int entries = 0; entries < 256; ++entries) {
+                   uint32_t w0 = pf_r32(e), n = w0 & 0x1ff, len = (w0 >> 9) & 0x3f;
+          @@ -127,17 +127,29 @@
+                   }
+                   for (uint32_t l = 0; l < n && (w0 & 0x00200000u) && picture; ++l) {
+                       if (++lines > 512) return false;
+          -            for (uint32_t x = 0; x < 320; ++x) {
+          -                uint32_t w = pf_r32(cur + 4 * x), p = odd ? w & 0xffff : w >> 16;
+          -                rgb.push_back(clut[(p >> 10) & 31][0]);
+          -                rgb.push_back(clut[(p >> 5) & 31][1]);
+          -                rgb.push_back(clut[p & 31][2]);
+          +            // the pen's colour in the three channels, once, then a row is table reads and stores
+          +            uint8_t* out = rgb.data() + (size_t)(lines - 1) * 960;
+          +            if (cur + 1280 <= ARM_MEM_SIZE) {
+          +                const uint8_t* src = g_arm_mem + cur;               // big-endian words, the even line in the high half
+          +                for (uint32_t x = 0; x < 320; ++x, src += 4, out += 3) {
+          +                    uint32_t p = odd ? src[2] << 8 | src[3] : src[0] << 8 | src[1];
+          +                    out[0] = clut[(p >> 10) & 31][0];
+          +                    out[1] = clut[(p >> 5) & 31][1];
+          +                    out[2] = clut[p & 31][2];
+          +                }
+          +            } else {
+          +                for (uint32_t x = 0; x < 320; ++x, out += 3) {
+          +                    uint32_t w = pf_r32(cur + 4 * x), p = odd ? w & 0xffff : w >> 16;
+          +                    out[0] = clut[(p >> 10) & 31][0];
+          +                    out[1] = clut[(p >> 5) & 31][1];
+          +                    out[2] = clut[p & 31][2];
+          +                }
+                       }
+                       if (odd) cur += 1280;
+                       odd = !odd;
+                   }
+                   e = pf_r32(e + 12);
+          -        if (e == first) return true;
+          +        if (e == first) { rgb.resize((size_t)lines * 960); return true; }
+               }
+               return false;
+           }
+          PERF_EOF
+          if patch -p1 --dry-run < "$WORK/nfs-perf.patch" >/dev/null; then
+            patch -p1 < "$WORK/nfs-perf.patch"
+          else
+            echo "::warning::speed patch does not apply to this 3dokit revision; building without it"
+          fi
+
+      - name: Collect core sources and check the glue
+        id: glue
+        working-directory: ${{ github.workspace }}
+        run: |
+          set -euo pipefail
+          mkdir -p "$P/build/recomp" "$P/core" "$WORK/diag"
+          cp build/recomp/*.cpp build/recomp/*.h "$P/build/recomp/" 2>/dev/null || true
+          cp 3dokit/runtime/*.h "$P/core/"
+          cp 3dokit/runtime/*.h "$P/build/recomp/"   # generated files #include "arm60.h": found next to them
+          for f in 3dokit/runtime/*.cpp; do
+            case "$(basename "$f")" in pf_window.cpp|arm_selftest.cpp|arm_stub.cpp) ;; *) cp "$f" "$P/core/" ;; esac
+          done
+          ls "$P/core"
+          echo "::group::pf_file.cpp filesystem usage"
+          grep -n -E "fs::|filesystem|directory_iterator|directory_entry|\\bpath\\b" 3dokit/runtime/pf_file.cpp | head -100 || true
+          echo "::endgroup::"
+          sed -i -e 's/^int main(int argc, char\*\* argv) {/int pf_boot_main(int argc, char** argv) {/' -e '1i #define TDK_WINDOW 1' "$P/core/pf_main.cpp"
+          grep -n "pf_boot_main\|TDK_WINDOW" "$P/core/pf_main.cpp" | head -5
+          # std::filesystem has no implementation for armv7 iOS 7: pf_file.cpp gets the POSIX shim instead
+          sed -i -e 's|#include <filesystem>|#include "fs_shim.h"|' -e 's|namespace fs = std::filesystem;|namespace fs = fsshim;|' "$P/core/pf_file.cpp"
+          grep -n "fs_shim\|fsshim\|std::filesystem" "$P/core/pf_file.cpp" | head -5
+          python3 - "$P/core/pf_os.cpp" <<'PYEOF'
+          import sys
+          p = sys.argv[1]; s = open(p).read()
+          old = 'static thread_local uint32_t t_site;'
+          new = """#include <pthread.h>
+          struct TlsSite {   // thread_local needs iOS 9; this is the iOS 7 way
+              static pthread_key_t key() { static pthread_key_t k; static pthread_once_t o = PTHREAD_ONCE_INIT;
+                  pthread_once(&o, [] { pthread_key_create(&k, nullptr); }); return k; }
+              operator uint32_t() const { return (uint32_t)(uintptr_t)pthread_getspecific(key()); }
+              TlsSite& operator=(uint32_t v) { pthread_setspecific(key(), (void*)(uintptr_t)v); return *this; }
+          };
+          static TlsSite t_site;"""
+          if old in s: open(p, 'w').write(s.replace(old, new)); print("patched thread_local in pf_os.cpp")
+          else: print("::warning::thread_local line not found in pf_os.cpp")
+          PYEOF
+          # the runtime sources, wherever 3dokit keeps them (layout not known to this workflow's author)
+          find 3dokit build/recomp -name '*.cpp' -o -name '*.h' -o -name 'CMakeLists.txt' | sort > "$WORK/diag/files.txt"
+          grep -rl 'SDL' 3dokit build/recomp --include='*.cpp' --include='*.h' > "$WORK/diag/sdl-users.txt" || true
+          grep -rn 'int main *(' 3dokit build/recomp --include='*.cpp' > "$WORK/diag/mains.txt" || true
+          cat build/recomp/CMakeLists.txt > "$WORK/diag/recomp-CMakeLists.txt" 2>/dev/null || true
+          wc -l "$WORK"/diag/*.txt
+          echo "::group::files.txt";            cat "$WORK/diag/files.txt";            echo "::endgroup::"
+          echo "::group::mains.txt";            cat "$WORK/diag/mains.txt";            echo "::endgroup::"
+          echo "::group::sdl-users.txt";        cat "$WORK/diag/sdl-users.txt";        echo "::endgroup::"
+          echo "::group::recomp-CMakeLists.txt"; cat "$WORK/diag/recomp-CMakeLists.txt"; echo "::endgroup::"
+          for f in $(cut -d: -f1 "$WORK/diag/mains.txt" "$WORK/diag/sdl-users.txt" | sort -u); do
+            echo "::group::SDL/func lines in $f ($(wc -l < "$f") lines)"
+            grep -n -E 'SDL_|^[A-Za-z_][A-Za-z0-9_:<>\*& ]* [A-Za-z_][A-Za-z0-9_:]*\(.*\) *(const)? *\{?$|^#include' "$f" | head -250 || true
+            echo "::endgroup::"
+          done
+          echo "::group::recomp report.txt"; head -60 build/recomp/report.txt 2>/dev/null || true; echo "::endgroup::"
+          R=3dokit/runtime
+          for f in $R/runtime.cmake $R/pf_window.cpp $R/pf_main.cpp; do
+            echo "::group::FULL $f"; cat "$f"; echo "::endgroup::"
+          done
+          echo "::group::pf.h ($(wc -l < $R/pf.h) lines): window/pad/audio/vbl/frame lines"
+          grep -n -i -E 'window|audio|vbl|pad|frame|present|hook|namespace|std::function' $R/pf.h | head -150 || true
+          echo "::endgroup::"
+          echo "::group::C++ features used by the runtime"
+          grep -rnE 'std::(optional|variant|string_view|filesystem|span|bit_cast|popcount|countl_zero|countr_zero|format|ranges|jthread)|<(bit|span|filesystem|optional|string_view|variant|format|ranges)>|thread_local|\brequires\b|\bconcept\b|std::atomic|std::thread|std::mutex|aligned_alloc|__builtin_' $R | cut -c1-170 | head -120 || true
+          echo "::endgroup::"
+          if [ -f "$P/core/nfs_core_glue.cpp" ]; then echo "ready=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "ready=false" >> "$GITHUB_OUTPUT"
+            echo "::warning::core/nfs_core_glue.cpp is not written yet: pfboot (SDL3) is not wired to host/nfs_host.h. Download the 'diagnostics' artifact and send it back; the Theos build is skipped until then."
+          fi
+
+      - name: Install Theos + iOS toolchain
+        if: steps.glue.outputs.ready == 'true'
+        env:
+          THEOS: ${{ github.workspace }}/theos
+        run: |
+          set -euo pipefail
+          git clone --recursive https://github.com/theos/theos.git "$THEOS"
+          mkdir -p "$THEOS/toolchain/linux/iphone" "$THEOS/sdks"
+          curl -fsSL "https://github.com/L1ghtmann/llvm-project/releases/download/main-update_3-eabca92/iOSToolchain-x86_64.tar.xz" -o /tmp/tc.tar.xz
+          tar -xf /tmp/tc.tar.xz -C "$THEOS/toolchain"
+          curl -fsSL -o /tmp/sdk.tbz2 "https://raw.githubusercontent.com/Sn0wCooder/theos-sdks/master/iPhoneOS9.3.sdk.tbz2"
+          tar -xjf /tmp/sdk.tbz2 -C "$THEOS/sdks"
+          SDK="$THEOS/sdks/iPhoneOS9.3.sdk"
+          for fw in "$SDK"/System/Library/Frameworks/*.framework; do
+            if [ -f "$fw/module.map" ]; then mkdir -p "$fw/Modules"; mv "$fw/module.map" "$fw/Modules/module.modulemap"; fi
+          done
+          find "$SDK/usr/include" -name module.map | while read -r m; do mv "$m" "$(dirname "$m")/module.modulemap"; done
+          # the toolchain ships a modern libc++ (<bit>, <filesystem>...) but not its generated __config_site
+          CXXH="$THEOS/toolchain/linux/iphone/include/c++/v1"
+          if [ -d "$CXXH" ] && [ ! -f "$CXXH/__config_site" ]; then
+          cat > "$CXXH/__config_site" <<'SITE'
+          #ifndef _LIBCPP___CONFIG_SITE
+          #define _LIBCPP___CONFIG_SITE
+          #define _LIBCPP_ABI_VERSION 1
+          #define _LIBCPP_ABI_NAMESPACE __1
+          #define _LIBCPP_HAS_THREAD_API_PTHREAD
+          #define _LIBCPP_HAS_NO_VENDOR_AVAILABILITY_ANNOTATIONS
+          #define _LIBCPP_HARDENING_MODE_DEFAULT _LIBCPP_HARDENING_MODE_NONE
+          #define _LIBCPP_PSTL_BACKEND_SERIAL
+          #define _LIBCPP_PSTL_CPU_BACKEND_SERIAL
+          #define _LIBCPP_DISABLE_EXTERN_TEMPLATE
+          #endif
+          SITE
+          fi
+          echo "::group::toolchain libc++ info"
+          "$THEOS/toolchain/linux/iphone/bin/clang++" --version || true
+          grep -m3 -E "define _LIBCPP_VERSION|define _LIBCPP_ABI_VERSION" "$CXXH/__config" || true
+          ls "$CXXH" | head -20; ls "$CXXH" | wc -l
+          find "$THEOS/toolchain" "$THEOS/sdks" \( -name 'libc++*' -o -name 'libc++abi*' \) | head -20
+          echo "::endgroup::"
+          echo "THEOS=$THEOS" >> "$GITHUB_ENV"
+
+      - name: Build with Theos
+        if: steps.glue.outputs.ready == 'true'
+        working-directory: ${{ env.P }}
+        env:
+          FINALPACKAGE: "1"
+        run: |
+          set -euo pipefail
+          make clean || true
+          make -k -j3 package FINALPACKAGE=1 messages=yes 2>&1 | tee "$WORK/theos.log" || {
+            echo "::group::first errors"; grep -n -E "error:|undefined symbol|ld:" "$WORK/theos.log" | sed -e 's/\x1b\[[0-9;]*m//g' | cut -c1-260 | head -200; echo "::endgroup::"
+            exit 1
+          }
+          ls -la packages
+
+      - name: Pack .ipa
+        if: steps.glue.outputs.ready == 'true'
+        working-directory: ${{ env.P }}
+        run: |
+          set -euo pipefail
+          APP=".theos/obj/NeedForSpeed3DO.app"; [ -d "$APP" ] || APP="$(find .theos -type d -name NeedForSpeed3DO.app | head -n1)"
+          [ -n "$APP" ] || { echo "::error::NeedForSpeed3DO.app not found"; exit 1; }
+          rm -rf ipa && mkdir -p ipa/Payload packages
+          cp -a "$APP" ipa/Payload/
+          (cd ipa && zip -rq ../packages/NeedForSpeed3DO-armv7.ipa Payload)
+          ls -la packages
+
+      - uses: actions/upload-artifact@v4
+        if: steps.glue.outputs.ready == 'true'
+        with:
+          name: NeedForSpeed3DO-armv7-iOS7
+          path: |
+            ${{ env.P }}/packages/*.ipa
+            ${{ env.P }}/packages/*.deb
+          if-no-files-found: error
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: diagnostics
+          path: |
+            ${{ env.WORK }}/diag
+            ${{ env.WORK }}/recomp.log
+            ${{ env.WORK }}/theos.log
+          if-no-files-found: ignore
