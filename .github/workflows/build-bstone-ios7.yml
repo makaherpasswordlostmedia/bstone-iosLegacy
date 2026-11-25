@@ -142,7 +142,7 @@ jobs:
           	-Wno-error=non-modular-include-in-module -Wno-non-modular-include-in-module \
           	-Wno-error
 
-          BStoneiOS7_CFLAGS = -O2 -fno-modules -fno-cxx-modules -DNDEBUG -DBSTONE_IOS=1 -DSTBI_NO_THREAD_LOCALS -DVK_NO_PROTOTYPES -fno-strict-aliasing \
+          BStoneiOS7_CFLAGS = -O2 -fno-modules -fno-cxx-modules -DNDEBUG -fno-omit-frame-pointer -DBSTONE_IOS=1 -DSTBI_NO_THREAD_LOCALS -DVK_NO_PROTOTYPES -fno-strict-aliasing \
           	$(BS_INCLUDES) $(BS_WARN)
           # C++14 only: libc++ of the 9.3 SDK, nothing newer than iOS 7 runtime features (no thread_local, no clock_gettime).
           # The toolchain ships a modern libc++ (clang 19, needs __config_site + C++ modules) whose ABI is newer than the
@@ -228,6 +228,7 @@ jobs:
           @implementation BSAppDelegate
 
           - (BOOL)application:(UIApplication*)application didFinishLaunchingWithOptions:(NSDictionary*)launchOptions {
+          	bsios_trace("AppDelegate didFinishLaunching");
           	BSHost_LoadConfig();
           	application.idleTimerDisabled = YES;
           	self.window = [[UIWindow alloc] initWithFrame:[UIScreen mainScreen].bounds];
@@ -244,6 +245,8 @@ jobs:
           }
 
           - (void)applicationWillResignActive:(UIApplication*)application {
+          	bsios_trace("AppDelegate willResignActive");
+          	bsios_run_state(0);
           	bsios_event_push_focus(0);
           	BSAudio_SetSuspended(YES);
           	BSHost_SetActive(NO);
@@ -252,12 +255,15 @@ jobs:
           }
 
           - (void)applicationDidBecomeActive:(UIApplication*)application {
+          	bsios_trace("AppDelegate didBecomeActive");
+          	bsios_run_state(1);
           	BSHost_SetActive(YES);
           	BSAudio_SetSuspended(NO);
           	bsios_event_push_focus(1);
           }
 
           - (void)applicationDidReceiveMemoryWarning:(UIApplication*)application {
+          	bsios_trace_mem("MEMORY WARNING");
           	NSLog(@"BStone: memory warning");
           }
 
@@ -451,30 +457,78 @@ jobs:
           	DestroyGLObjects();
           }
 
+          static const char* GLStr(GLenum name) {
+          	const char* v = (const char*)glGetString(name);
+          	return v ? v : "(null)";
+          }
+
+          static void TraceGLError(const char* where) {
+          	GLenum e = glGetError();
+          	if (e != GL_NO_ERROR) bsios_trace("GL ERROR 0x%04X after %s", (unsigned)e, where);
+          }
+
           extern "C" int bsios_gl_create(int depth_bits) {
+          	bsios_trace("bsios_gl_create(depth_bits=%d)", depth_bits);
+          	bsios_trace_mem("before gl create");
           	DestroyGLObjects();
 
           	BSGLView* view = BSHost_GLView();
-          	if (!view) return -1;
+          	if (!view) {
+          		bsios_trace("bsios_gl_create: no BSGLView yet -> -1");
+          		return -1;
+          	}
+          	bsios_trace("view %.0fx%.0f scale=%.1f layer=%s", (double)view.bounds.size.width,
+          	            (double)view.bounds.size.height, (double)view.contentScaleFactor,
+          	            NSStringFromClass([view.layer class]).UTF8String);
 
           	g_ctx = [[EAGLContext alloc] initWithAPI:kEAGLRenderingAPIOpenGLES2];
+          	bsios_trace("EAGLContext(ES2) = %p", (__bridge void*)g_ctx);
           	if (!g_ctx || ![EAGLContext setCurrentContext:g_ctx]) {
+          		bsios_trace("EAGLContext create/setCurrentContext FAILED -> -2");
           		g_ctx = nil;
           		return -2;
           	}
+
+          	bsios_trace("GL_VENDOR=%s", GLStr(GL_VENDOR));
+          	bsios_trace("GL_RENDERER=%s", GLStr(GL_RENDERER));
+          	bsios_trace("GL_VERSION=%s", GLStr(GL_VERSION));
+          	bsios_trace("GL_SHADING_LANGUAGE_VERSION=%s", GLStr(GL_SHADING_LANGUAGE_VERSION));
+          	{
+          		const char* ext = GLStr(GL_EXTENSIONS);
+          		size_t len = strlen(ext);
+          		for (size_t i = 0; i < len; i += 400) bsios_trace("GL_EXTENSIONS[%zu]: %.400s", i, ext + i);
+          	}
+          	{
+          		GLint v = 0;
+          		glGetIntegerv(GL_MAX_TEXTURE_SIZE, &v);
+          		GLint rb = 0;
+          		glGetIntegerv(GL_MAX_RENDERBUFFER_SIZE, &rb);
+          		GLint va = 0;
+          		glGetIntegerv(GL_MAX_VERTEX_ATTRIBS, &va);
+          		GLint tu = 0;
+          		glGetIntegerv(GL_MAX_TEXTURE_IMAGE_UNITS, &tu);
+          		bsios_trace("limits: max_texture=%d max_renderbuffer=%d max_vertex_attribs=%d max_texture_units=%d",
+          		            (int)v, (int)rb, (int)va, (int)tu);
+          	}
+          	TraceGLError("context creation / queries");
 
           	glGenFramebuffers(1, &g_fbo);
           	glGenRenderbuffers(1, &g_color_rb);
           	glBindFramebuffer(GL_FRAMEBUFFER, g_fbo);
           	glBindRenderbuffer(GL_RENDERBUFFER, g_color_rb);
+          	bsios_trace("fbo=%u color_rb=%u", (unsigned)g_fbo, (unsigned)g_color_rb);
+          	TraceGLError("fbo/renderbuffer generation");
 
           	if (![g_ctx renderbufferStorage:GL_RENDERBUFFER fromDrawable:(CAEAGLLayer*)view.layer]) {
+          		bsios_trace("renderbufferStorage:fromDrawable: FAILED -> -3");
           		DestroyGLObjects();
           		return -3;
           	}
           	glGetRenderbufferParameteriv(GL_RENDERBUFFER, GL_RENDERBUFFER_WIDTH, &g_w);
           	glGetRenderbufferParameteriv(GL_RENDERBUFFER, GL_RENDERBUFFER_HEIGHT, &g_h);
           	glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_RENDERBUFFER, g_color_rb);
+          	bsios_trace("drawable renderbuffer %dx%d", (int)g_w, (int)g_h);
+          	TraceGLError("color attachment");
 
           	if (depth_bits > 0) {
           		glGenRenderbuffers(1, &g_depth_rb);
@@ -484,14 +538,21 @@ jobs:
           		glRenderbufferStorage(GL_RENDERBUFFER, depth_bits > 16 ? GL_DEPTH_COMPONENT24_OES : GL_DEPTH_COMPONENT16,
           		                      g_w, g_h);
           		glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_DEPTH_ATTACHMENT, GL_RENDERBUFFER, g_depth_rb);
+          		bsios_trace("depth renderbuffer %u (%d bit)", (unsigned)g_depth_rb, depth_bits > 16 ? 24 : 16);
+          		TraceGLError("depth attachment");
           	}
 
-          	if (glCheckFramebufferStatus(GL_FRAMEBUFFER) != GL_FRAMEBUFFER_COMPLETE) {
+          	GLenum status = glCheckFramebufferStatus(GL_FRAMEBUFFER);
+          	bsios_trace("glCheckFramebufferStatus = 0x%04X", (unsigned)status);
+          	if (status != GL_FRAMEBUFFER_COMPLETE) {
           		DestroyGLObjects();
           		return -4;
           	}
 
           	glViewport(0, 0, g_w, g_h);
+          	TraceGLError("viewport");
+          	bsios_trace_mem("after gl create");
+          	bsios_trace("bsios_gl_create OK");
           	return 0;
           }
 
@@ -512,6 +573,11 @@ jobs:
           	BSHost_ParkIfInactive(&glFinish);
           	glBindRenderbuffer(GL_RENDERBUFFER, g_color_rb);
           	[g_ctx presentRenderbuffer:GL_RENDERBUFFER];
+          	static int swap_traces = 0;
+          	if (swap_traces < 3) {
+          		++swap_traces;
+          		bsios_trace("first frames presented (#%d)", swap_traces);
+          	}
           }
           BSIOS_EOF
           mkdir -p "$(dirname 'ios/src/app/BSGLView.h')"
@@ -875,7 +941,10 @@ jobs:
           		int argc = (int)g_argv_storage.count;
           		char** argv = (char**)calloc((size_t)argc + 1, sizeof(char*));
           		for (int i = 0; i < argc; i++) argv[i] = (char*)[g_argv_storage[i] UTF8String];
+          		bsios_crash_thread_init("game");
+          		bsios_trace("game thread: calling bstone_game_main(argc=%d)", argc);
           		int rc = bstone_game_main(argc, argv);
+          		bsios_trace("game thread: bstone_game_main returned %d", rc);
           		free(argv);
           		g_game_finished.store(1);
           		EnsureCond();
@@ -911,6 +980,10 @@ jobs:
           	[g_argv_storage addObject:docs];
           	[g_argv_storage addObject:@"--profile_dir"];
           	[g_argv_storage addObject:profile];
+          	// Write bstone_log.txt synchronously and flush every line: the default asynchronous logger loses
+          	// the last lines before a crash, which hides where the game actually died.
+          	[g_argv_storage addObject:@"--log_sync"];
+          	[g_argv_storage addObject:@"--log_flush_every_message"];
 
           	NSString* ini = LoadIniText();
           	NSString* extra = ini ? ReadIniValue(ini, @"args") : nil;
@@ -918,6 +991,8 @@ jobs:
           		for (NSString* a in [extra componentsSeparatedByCharactersInSet:[NSCharacterSet whitespaceCharacterSet]])
           			if (a.length) [g_argv_storage addObject:a];
           	}
+
+          	for (NSString* a in g_argv_storage) bsios_trace("argv: %s", a.UTF8String);
 
           	pthread_attr_t attr;
           	pthread_attr_init(&attr);
@@ -1275,8 +1350,10 @@ jobs:
           cat > 'ios/src/app/main.mm' <<'BSIOS_EOF'
           #import <UIKit/UIKit.h>
           #import "BSAppDelegate.h"
+          #include "bsios_bridge.h"
 
           int main(int argc, char* argv[]) {
+          	bsios_crash_install(); // first thing: crash reporter, breadcrumb trace, heartbeat
           	@autoreleasepool {
           		return UIApplicationMain(argc, argv, nil, NSStringFromClass([BSAppDelegate class]));
           	}
@@ -1407,11 +1484,1050 @@ jobs:
           /* Renamed main() of the game (3d_main.cpp). Runs on the game thread. */
           int bstone_game_main(int argc, char* argv[]);
 
+          /* ------------------------------------------------------------------------ */
+          /* Diagnostics: crash reporter + breadcrumb trace (bstone_ios_crash.cpp).    */
+          /* Files: <Documents>/profile/bstone_{trace,trace_prev,crash}.txt            */
+          /* ------------------------------------------------------------------------ */
+
+          /* ObjC wrapper (BSCrash.mm): call first thing in main(). */
+          void bsios_crash_install(void);
+          void bsios_crash_install_dir(const char* profile_dir, const char* device_info);
+          /* Call at the start of every thread worth naming (alternate signal stack + label). */
+          void bsios_crash_thread_init(const char* name);
+          /* Appends text to bstone_crash.txt (used for uncaught Objective-C exceptions). */
+          void bsios_crash_note(const char* text);
+          /* Unbuffered breadcrumb: survives any crash. Also kept in a ring dumped into crash reports. */
+          void bsios_trace(const char* fmt, ...) __attribute__((format(printf, 1, 2)));
+          void bsios_trace_mem(const char* tag);
+          /* 1 while the app is in the foreground and active, 0 otherwise: detects kills without a crash report. */
+          void bsios_run_state(int is_foreground_active);
+
           #ifdef __cplusplus
           }
           #endif
 
           #endif /* BSIOS_BRIDGE_H_ */
+          BSIOS_EOF
+          mkdir -p 'ios/src/app'
+          cat > 'ios/src/app/BSCrash.mm' <<'BSIOS_EOF'
+          // BSCrash.mm -- Objective-C side of the diagnostics: Documents path, device info, uncaught NSException.
+          #import <Foundation/Foundation.h>
+          #import <UIKit/UIKit.h>
+          #include <sys/utsname.h>
+          #include "bsios_bridge.h"
+
+          static void BSUncaughtException(NSException* e) {
+          	NSMutableString* s = [NSMutableString string];
+          	[s appendFormat:@"uncaught Objective-C exception\nname: %@\nreason: %@\n", e.name, e.reason];
+          	[s appendString:@"return addresses (unslid = address - slide):"];
+          	for (NSNumber* n in e.callStackReturnAddresses) [s appendFormat:@" 0x%08llx", n.unsignedLongLongValue];
+          	[s appendFormat:@"\nsymbols:\n%@", [e.callStackSymbols componentsJoinedByString:@"\n"]];
+          	bsios_crash_note(s.UTF8String);
+          }
+
+          extern "C" void bsios_crash_install(void) {
+          	NSString* docs = [NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES) firstObject];
+          	NSString* dir = [docs stringByAppendingString:@"/profile/"];
+          	struct utsname u;
+          	uname(&u);
+          	NSString* info = [NSString stringWithFormat:@"%s, iOS %@, RAM %llu MB", u.machine,
+          	                  [UIDevice currentDevice].systemVersion,
+          	                  (unsigned long long)([NSProcessInfo processInfo].physicalMemory >> 20)];
+          	bsios_crash_install_dir([dir fileSystemRepresentation], [info UTF8String]);
+          	NSSetUncaughtExceptionHandler(&BSUncaughtException);
+          }
+          BSIOS_EOF
+          mkdir -p 'ios/src/sys'
+          cat > 'ios/src/sys/bstone_ios_crash.cpp' <<'BSIOS_EOF'
+          // bstone_ios_crash.cpp -- crash reporter + breadcrumb trace for the BStone iOS port.
+          //
+          // Files written into <Documents>/profile/ :
+          //   bstone_trace.txt        breadcrumbs of the current run, written unbuffered (survives any crash)
+          //   bstone_trace_prev.txt   the same for the previous run
+          //   bstone_crash.txt        crash reports (signal / std::terminate / ObjC exception), appended
+          //
+          // The signal handler only uses async-signal-safe calls (open/write/unlink, no malloc, no stdio).
+          // The raw backtrace is written first, the dladdr() symbolised copy second.
+          #include <errno.h>
+          #include <fcntl.h>
+          #include <pthread.h>
+          #include <signal.h>
+          #include <stdarg.h>
+          #include <stdint.h>
+          #include <stdio.h>
+          #include <stdlib.h>
+          #include <string.h>
+          #include <unistd.h>
+          #include <dlfcn.h>
+          #include <exception>
+          #include <sys/stat.h>
+          #include <sys/time.h>
+          #include <sys/ucontext.h>
+          #include <mach/mach.h>
+          #include <mach-o/dyld.h>
+          #include <mach-o/loader.h>
+
+          #include "bsios_bridge.h"
+
+          #define BS_BUILD_ID __DATE__ " " __TIME__
+
+          namespace {
+
+          const int kRingSize = 96;
+          const int kLineSize = 220;
+          const int kMaxThreads = 16;
+          const size_t kAltStackSize = 128 * 1024;
+
+          char g_dir[900];
+          char g_crash_path[1000];
+          char g_trace_path[1000];
+          char g_flag_path[1000];
+          char g_device_info[400];
+          int g_trace_fd = -1;
+          timeval g_t0;
+
+          char g_ring[kRingSize][kLineSize];
+          volatile unsigned g_ring_pos = 0;
+
+          struct ThreadSlot
+          {
+          	pthread_t th;
+          	char name[24];
+          };
+
+          ThreadSlot g_threads[kMaxThreads];
+          volatile int g_thread_count = 0;
+
+          volatile sig_atomic_t g_in_crash = 0;
+          volatile sig_atomic_t g_terminate_active = 0;
+          volatile sig_atomic_t g_report_written = 0;
+
+          // ---------------------------------------------------------------------------
+          // async-signal-safe output helpers
+          // ---------------------------------------------------------------------------
+          void wr(int fd, const char* s, size_t n)
+          {
+          	while (n > 0)
+          	{
+          		const ssize_t r = write(fd, s, n);
+
+          		if (r < 0)
+          		{
+          			if (errno == EINTR)
+          			{
+          				continue;
+          			}
+
+          			return;
+          		}
+
+          		if (r == 0)
+          		{
+          			return;
+          		}
+
+          		s += r;
+          		n -= static_cast<size_t>(r);
+          	}
+          }
+
+          void ws(int fd, const char* s)
+          {
+          	if (s == nullptr)
+          	{
+          		s = "(null)";
+          	}
+
+          	wr(fd, s, strlen(s));
+          }
+
+          void wh(int fd, uintptr_t v)
+          {
+          	char b[2 + sizeof(uintptr_t) * 2];
+          	b[0] = '0';
+          	b[1] = 'x';
+
+          	for (size_t i = 0; i < sizeof(uintptr_t) * 2; ++i)
+          	{
+          		const unsigned d = static_cast<unsigned>((v >> (4 * (sizeof(uintptr_t) * 2 - 1 - i))) & 0xF);
+          		b[2 + i] = static_cast<char>(d < 10 ? '0' + d : 'a' + (d - 10));
+          	}
+
+          	wr(fd, b, sizeof(b));
+          }
+
+          void wd(int fd, long v)
+          {
+          	char b[24];
+          	int i = 23;
+          	const bool neg = v < 0;
+          	unsigned long u = neg ? static_cast<unsigned long>(-(v + 1)) + 1UL : static_cast<unsigned long>(v);
+
+          	if (u == 0)
+          	{
+          		b[i--] = '0';
+          	}
+
+          	while (u != 0)
+          	{
+          		b[i--] = static_cast<char>('0' + (u % 10));
+          		u /= 10;
+          	}
+
+          	if (neg)
+          	{
+          		b[i--] = '-';
+          	}
+
+          	wr(fd, b + i + 1, static_cast<size_t>(23 - i));
+          }
+
+          long uptime_ms()
+          {
+          	timeval t;
+          	gettimeofday(&t, nullptr);
+          	return static_cast<long>((t.tv_sec - g_t0.tv_sec) * 1000L + (t.tv_usec - g_t0.tv_usec) / 1000L);
+          }
+
+          const char* thread_label(pthread_t self)
+          {
+          	int n = g_thread_count;
+
+          	if (n > kMaxThreads)
+          	{
+          		n = kMaxThreads;
+          	}
+
+          	for (int i = 0; i < n; ++i)
+          	{
+          		if (pthread_equal(g_threads[i].th, self))
+          		{
+          			return g_threads[i].name;
+          		}
+          	}
+
+          	return pthread_main_np() != 0 ? "main" : "other";
+          }
+
+          // ---------------------------------------------------------------------------
+          // memory
+          // ---------------------------------------------------------------------------
+          void get_mem(unsigned long* resident, unsigned long* free_bytes, unsigned long* inactive_bytes)
+          {
+          	*resident = 0;
+          	*free_bytes = 0;
+          	*inactive_bytes = 0;
+
+          	task_basic_info_data_t ti;
+          	mach_msg_type_number_t ti_count = TASK_BASIC_INFO_COUNT;
+
+          	if (task_info(mach_task_self(), TASK_BASIC_INFO, reinterpret_cast<task_info_t>(&ti), &ti_count) == KERN_SUCCESS)
+          	{
+          		*resident = static_cast<unsigned long>(ti.resident_size);
+          	}
+
+          	vm_size_t page_size = 4096;
+          	host_page_size(mach_host_self(), &page_size);
+
+          	vm_statistics_data_t vm;
+          	mach_msg_type_number_t vm_count = HOST_VM_INFO_COUNT;
+
+          	if (host_statistics(mach_host_self(), HOST_VM_INFO, reinterpret_cast<host_info_t>(&vm), &vm_count) == KERN_SUCCESS)
+          	{
+          		*free_bytes = static_cast<unsigned long>(vm.free_count) * static_cast<unsigned long>(page_size);
+          		*inactive_bytes = static_cast<unsigned long>(vm.inactive_count) * static_cast<unsigned long>(page_size);
+          	}
+          }
+
+          // ---------------------------------------------------------------------------
+          // images / frames
+          // ---------------------------------------------------------------------------
+          #ifdef __LP64__
+          typedef mach_header_64 BsMachHeader;
+          typedef segment_command_64 BsSegment;
+          const uint32_t kSegCmd = LC_SEGMENT_64;
+          #else
+          typedef mach_header BsMachHeader;
+          typedef segment_command BsSegment;
+          const uint32_t kSegCmd = LC_SEGMENT;
+          #endif
+
+          bool find_image(uintptr_t addr, uint32_t* index, intptr_t* slide)
+          {
+          	const uint32_t count = _dyld_image_count();
+
+          	for (uint32_t i = 0; i < count; ++i)
+          	{
+          		const BsMachHeader* const mh = reinterpret_cast<const BsMachHeader*>(_dyld_get_image_header(i));
+
+          		if (mh == nullptr)
+          		{
+          			continue;
+          		}
+
+          		const intptr_t image_slide = _dyld_get_image_vmaddr_slide(i);
+          		const uint8_t* p = reinterpret_cast<const uint8_t*>(mh + 1);
+
+          		for (uint32_t c = 0; c < mh->ncmds; ++c)
+          		{
+          			const load_command* const lc = reinterpret_cast<const load_command*>(p);
+
+          			if (lc->cmd == kSegCmd)
+          			{
+          				const BsSegment* const seg = reinterpret_cast<const BsSegment*>(lc);
+
+          				if (strcmp(seg->segname, "__PAGEZERO") != 0)
+          				{
+          					const uintptr_t lo = static_cast<uintptr_t>(seg->vmaddr) + static_cast<uintptr_t>(image_slide);
+          					const uintptr_t hi = lo + static_cast<uintptr_t>(seg->vmsize);
+
+          					if (addr >= lo && addr < hi)
+          					{
+          						*index = i;
+          						*slide = image_slide;
+          						return true;
+          					}
+          				}
+          			}
+
+          			p += lc->cmdsize;
+          		}
+          	}
+
+          	return false;
+          }
+
+          void write_uuid(int fd, const BsMachHeader* mh)
+          {
+          	const uint8_t* p = reinterpret_cast<const uint8_t*>(mh + 1);
+
+          	for (uint32_t c = 0; c < mh->ncmds; ++c)
+          	{
+          		const load_command* const lc = reinterpret_cast<const load_command*>(p);
+
+          		if (lc->cmd == LC_UUID)
+          		{
+          			const uuid_command* const u = reinterpret_cast<const uuid_command*>(lc);
+          			static const char hex[] = "0123456789ABCDEF";
+
+          			for (int i = 0; i < 16; ++i)
+          			{
+          				if (i == 4 || i == 6 || i == 8 || i == 10)
+          				{
+          					ws(fd, "-");
+          				}
+
+          				char two[3] = {hex[u->uuid[i] >> 4], hex[u->uuid[i] & 0xF], 0};
+          				ws(fd, two);
+          			}
+
+          			return;
+          		}
+
+          		p += lc->cmdsize;
+          	}
+
+          	ws(fd, "(no uuid)");
+          }
+
+          void dump_images(int fd)
+          {
+          	const uint32_t count = _dyld_image_count();
+
+          	ws(fd, "-- images (system libraries omitted; 'unslid' = address - slide, use it with the symbol list) --\n");
+
+          	for (uint32_t i = 0; i < count; ++i)
+          	{
+          		const char* const name = _dyld_get_image_name(i);
+
+          		if (name != nullptr && (strncmp(name, "/usr/lib/", 9) == 0 || strncmp(name, "/System/", 8) == 0))
+          		{
+          			continue;
+          		}
+
+          		ws(fd, "  image[");
+          		wd(fd, static_cast<long>(i));
+          		ws(fd, "] header=");
+          		wh(fd, reinterpret_cast<uintptr_t>(_dyld_get_image_header(i)));
+          		ws(fd, " slide=");
+          		wh(fd, static_cast<uintptr_t>(_dyld_get_image_vmaddr_slide(i)));
+          		ws(fd, " uuid=");
+          		write_uuid(fd, reinterpret_cast<const BsMachHeader*>(_dyld_get_image_header(i)));
+          		ws(fd, " ");
+          		ws(fd, name);
+          		ws(fd, "\n");
+          	}
+          }
+
+          void dump_frame(int fd, int depth, uintptr_t addr, bool symbolize)
+          {
+          #if defined(__arm__)
+          	// Thumb bit of a return address.
+          	const uintptr_t clean = addr & ~static_cast<uintptr_t>(1);
+          #else
+          	const uintptr_t clean = addr;
+          #endif
+
+          	ws(fd, "  #");
+          	wd(fd, depth);
+          	ws(fd, "  ");
+          	wh(fd, addr);
+
+          	uint32_t image_index = 0;
+          	intptr_t slide = 0;
+
+          	if (find_image(clean, &image_index, &slide))
+          	{
+          		const char* const name = _dyld_get_image_name(image_index);
+          		const char* base = name;
+
+          		for (const char* q = name; q != nullptr && *q != 0; ++q)
+          		{
+          			if (*q == '/')
+          			{
+          				base = q + 1;
+          			}
+          		}
+
+          		ws(fd, "  ");
+          		ws(fd, base);
+          		ws(fd, "  unslid=");
+          		wh(fd, clean - static_cast<uintptr_t>(slide));
+          	}
+          	else
+          	{
+          		ws(fd, "  (not in any image)");
+          	}
+
+          	if (symbolize)
+          	{
+          		Dl_info info;
+
+          		if (dladdr(reinterpret_cast<void*>(clean), &info) != 0 && info.dli_sname != nullptr)
+          		{
+          			ws(fd, "  ");
+          			ws(fd, info.dli_sname);
+          			ws(fd, "+");
+          			wd(fd, static_cast<long>(clean - reinterpret_cast<uintptr_t>(info.dli_saddr)));
+          		}
+          	}
+
+          	ws(fd, "\n");
+          }
+
+          struct Regs
+          {
+          	uintptr_t pc;
+          	uintptr_t lr;
+          	uintptr_t sp;
+          	uintptr_t fp;
+          	uintptr_t cpsr;
+          	uintptr_t r[13];
+          	bool has_all;
+          };
+
+          bool get_regs(void* uctx, Regs* out)
+          {
+          #if defined(__arm__)
+          	const ucontext_t* const uc = static_cast<const ucontext_t*>(uctx);
+
+          	if (uc == nullptr || uc->uc_mcontext == nullptr)
+          	{
+          		return false;
+          	}
+
+          	const auto& ss = uc->uc_mcontext->__ss;
+
+          	for (int i = 0; i < 13; ++i)
+          	{
+          		out->r[i] = ss.__r[i];
+          	}
+
+          	out->sp = ss.__sp;
+          	out->lr = ss.__lr;
+          	out->pc = ss.__pc;
+          	out->cpsr = ss.__cpsr;
+          	out->fp = ss.__r[7];
+          	out->has_all = true;
+          	return true;
+          #elif defined(__aarch64__)
+          	const ucontext_t* const uc = static_cast<const ucontext_t*>(uctx);
+
+          	if (uc == nullptr || uc->uc_mcontext == nullptr)
+          	{
+          		return false;
+          	}
+
+          	const auto& ss = uc->uc_mcontext->__ss;
+
+          	for (int i = 0; i < 13; ++i)
+          	{
+          		out->r[i] = static_cast<uintptr_t>(ss.__x[i]);
+          	}
+
+          	out->sp = static_cast<uintptr_t>(ss.__sp);
+          	out->lr = static_cast<uintptr_t>(ss.__lr);
+          	out->pc = static_cast<uintptr_t>(ss.__pc);
+          	out->cpsr = static_cast<uintptr_t>(ss.__cpsr);
+          	out->fp = static_cast<uintptr_t>(ss.__fp);
+          	out->has_all = true;
+          	return true;
+          #else
+          	static_cast<void>(uctx);
+          	static_cast<void>(out);
+          	return false;
+          #endif
+          }
+
+          void dump_registers(int fd, const Regs& g)
+          {
+          	ws(fd, "-- registers --\n");
+
+          	for (int i = 0; i < 13; ++i)
+          	{
+          		ws(fd, "  r");
+          		wd(fd, i);
+          		ws(fd, i < 10 ? "  = " : " = ");
+          		wh(fd, g.r[i]);
+          		ws(fd, (i % 3 == 2) ? "\n" : "");
+          	}
+
+          	ws(fd, "\n  sp = ");
+          	wh(fd, g.sp);
+          	ws(fd, "  lr = ");
+          	wh(fd, g.lr);
+          	ws(fd, "  pc = ");
+          	wh(fd, g.pc);
+          	ws(fd, "  cpsr = ");
+          	wh(fd, g.cpsr);
+          	ws(fd, "\n");
+          }
+
+          void dump_backtrace(int fd, const Regs& g, bool symbolize)
+          {
+          	const pthread_t self = pthread_self();
+          	const uintptr_t top = reinterpret_cast<uintptr_t>(pthread_get_stackaddr_np(self));
+          	const uintptr_t low = top - static_cast<uintptr_t>(pthread_get_stacksize_np(self));
+
+          	int depth = 0;
+          	dump_frame(fd, depth++, g.pc, symbolize);
+
+          	if (g.lr != 0 && g.lr != g.pc)
+          	{
+          		// LR is the caller when the crash happened in a leaf function or through a null pointer.
+          		dump_frame(fd, depth++, g.lr, symbolize);
+          	}
+
+          	uintptr_t fp = g.fp;
+
+          	while (depth < 60)
+          	{
+          		if (fp == 0 || (fp & (sizeof(uintptr_t) - 1)) != 0 || fp < low || fp + 2 * sizeof(uintptr_t) > top)
+          		{
+          			break;
+          		}
+
+          		const uintptr_t next = reinterpret_cast<const uintptr_t*>(fp)[0];
+          		const uintptr_t ret = reinterpret_cast<const uintptr_t*>(fp)[1];
+
+          		if (ret == 0)
+          		{
+          			break;
+          		}
+
+          		dump_frame(fd, depth++, ret, symbolize);
+
+          		if (next <= fp)
+          		{
+          			break;
+          		}
+
+          		fp = next;
+          	}
+          }
+
+          void dump_ring(int fd)
+          {
+          	ws(fd, "-- last breadcrumbs (oldest first) --\n");
+
+          	const unsigned pos = g_ring_pos;
+
+          	for (unsigned k = 0; k < static_cast<unsigned>(kRingSize); ++k)
+          	{
+          		const char* const line = g_ring[(pos + k) % static_cast<unsigned>(kRingSize)];
+
+          		if (line[0] != 0)
+          		{
+          			ws(fd, "  ");
+          			ws(fd, line);
+          			ws(fd, "\n");
+          		}
+          	}
+          }
+
+          void dump_common_head(int fd)
+          {
+          	ws(fd, "build: ");
+          	ws(fd, BS_BUILD_ID);
+          	ws(fd, "\ndevice: ");
+          	ws(fd, g_device_info);
+          	ws(fd, "\nuptime_ms: ");
+          	wd(fd, uptime_ms());
+          	ws(fd, "\n");
+          }
+
+          void dump_common_tail(int fd)
+          {
+          	unsigned long resident = 0;
+          	unsigned long free_bytes = 0;
+          	unsigned long inactive_bytes = 0;
+          	get_mem(&resident, &free_bytes, &inactive_bytes);
+
+          	ws(fd, "-- memory --\n  resident_mb=");
+          	wd(fd, static_cast<long>(resident >> 20));
+          	ws(fd, " free_mb=");
+          	wd(fd, static_cast<long>(free_bytes >> 20));
+          	ws(fd, " inactive_mb=");
+          	wd(fd, static_cast<long>(inactive_bytes >> 20));
+          	ws(fd, "\n");
+
+          	dump_ring(fd);
+          	dump_images(fd);
+          	ws(fd, "==== end of report ====\n");
+          }
+
+          int open_crash_file()
+          {
+          	const int fd = open(g_crash_path, O_WRONLY | O_CREAT | O_APPEND, 0644);
+          	return fd >= 0 ? fd : 2;
+          }
+
+          const char* signal_name(int sig)
+          {
+          	switch (sig)
+          	{
+          		case SIGSEGV: return "SIGSEGV (invalid memory access)";
+          		case SIGBUS: return "SIGBUS (bad alignment / unmapped file)";
+          		case SIGILL: return "SIGILL (illegal instruction)";
+          		case SIGFPE: return "SIGFPE (arithmetic error)";
+          		case SIGABRT: return "SIGABRT (abort())";
+          		case SIGTRAP: return "SIGTRAP (trap / breakpoint)";
+          		case SIGSYS: return "SIGSYS (bad system call)";
+          		default: return "?";
+          	}
+          }
+
+          void crash_signal_handler(int sig, siginfo_t* si, void* uctx)
+          {
+          	if (g_in_crash != 0)
+          	{
+          		return; // SA_RESETHAND: default action on re-entry
+          	}
+
+          	g_in_crash = 1;
+
+          	if (sig == SIGABRT && g_report_written != 0)
+          	{
+          		return; // std::terminate already wrote the full report
+          	}
+
+          	const int fd = open_crash_file();
+          	unlink(g_flag_path);
+
+          	ws(fd, "\n==== BStone iOS crash report: signal ====\n");
+          	dump_common_head(fd);
+
+          	ws(fd, "signal: ");
+          	wd(fd, sig);
+          	ws(fd, " ");
+          	ws(fd, signal_name(sig));
+          	ws(fd, "\ncode: ");
+          	wd(fd, si != nullptr ? si->si_code : 0);
+          	ws(fd, "  fault_addr: ");
+          	wh(fd, si != nullptr ? reinterpret_cast<uintptr_t>(si->si_addr) : 0);
+          	ws(fd, "\nthread: ");
+          	ws(fd, thread_label(pthread_self()));
+          	ws(fd, " pthread=");
+          	wh(fd, reinterpret_cast<uintptr_t>(pthread_self()));
+          	ws(fd, "\n");
+
+          	Regs g;
+          	memset(&g, 0, sizeof(g));
+
+          	if (get_regs(uctx, &g))
+          	{
+          		const uintptr_t fault = si != nullptr ? reinterpret_cast<uintptr_t>(si->si_addr) : 0;
+          		const pthread_t self = pthread_self();
+          		const uintptr_t top = reinterpret_cast<uintptr_t>(pthread_get_stackaddr_np(self));
+          		const uintptr_t low = top - static_cast<uintptr_t>(pthread_get_stacksize_np(self));
+
+          		ws(fd, "diagnosis:");
+
+          		if (g.pc < 0x1000)
+          		{
+          			ws(fd, " PC is ~0: a call through a NULL function pointer (a GL/AL function that was not resolved?);"
+          				" the caller is LR (frame #1).");
+          		}
+          		else if ((sig == SIGSEGV || sig == SIGBUS) && fault < 0x1000)
+          		{
+          			ws(fd, " NULL pointer dereference (offset ");
+          			wh(fd, fault);
+          			ws(fd, ").");
+          		}
+          		else if ((sig == SIGSEGV || sig == SIGBUS) && fault + (1u << 20) >= low && fault < low + 4096)
+          		{
+          			ws(fd, " the fault address is next to the stack limit: stack overflow is likely.");
+          		}
+          		else if (sig == SIGILL)
+          		{
+          			ws(fd, " illegal instruction: code uses a CPU feature this device does not have, or a jump into data.");
+          		}
+          		else if (sig == SIGABRT)
+          		{
+          			ws(fd, " abort() was called (failed assert, uncaught exception, runtime check).");
+          		}
+          		else
+          		{
+          			ws(fd, " (no automatic diagnosis)");
+          		}
+
+          		ws(fd, "\n");
+          		dump_registers(fd, g);
+          		ws(fd, "-- backtrace (raw, use 'unslid' with the symbol list) --\n");
+          		dump_backtrace(fd, g, false);
+          		ws(fd, "-- backtrace (dladdr names, may be empty for a stripped binary) --\n");
+          		dump_backtrace(fd, g, true);
+          	}
+          	else
+          	{
+          		ws(fd, "(registers unavailable on this architecture)\n");
+          	}
+
+          	dump_common_tail(fd);
+          	g_report_written = 1;
+
+          	if (fd > 2)
+          	{
+          		close(fd);
+          	}
+          }
+
+          void bs_terminate_handler()
+          {
+          	if (g_terminate_active != 0)
+          	{
+          		abort();
+          	}
+
+          	g_terminate_active = 1;
+
+          	const int fd = open_crash_file();
+          	unlink(g_flag_path);
+
+          	ws(fd, "\n==== BStone iOS crash report: std::terminate ====\n");
+          	dump_common_head(fd);
+          	ws(fd, "thread: ");
+          	ws(fd, thread_label(pthread_self()));
+          	ws(fd, "\n");
+
+          	if (std::current_exception() != nullptr)
+          	{
+          		try
+          		{
+          			throw;
+          		}
+          		catch (const std::exception& e)
+          		{
+          			ws(fd, "uncaught C++ exception, what(): ");
+          			ws(fd, e.what());
+          			ws(fd, "\n");
+          		}
+          		catch (...)
+          		{
+          			ws(fd, "uncaught C++ exception of unknown type\n");
+          		}
+          	}
+          	else
+          	{
+          		ws(fd, "std::terminate() called without an active exception (noexcept violation / pure virtual call?)\n");
+          	}
+
+          	Regs g;
+          	memset(&g, 0, sizeof(g));
+          	g.pc = reinterpret_cast<uintptr_t>(__builtin_return_address(0));
+          	g.fp = reinterpret_cast<uintptr_t>(__builtin_frame_address(0));
+
+          	ws(fd, "-- backtrace (raw) --\n");
+          	dump_backtrace(fd, g, false);
+          	ws(fd, "-- backtrace (dladdr names) --\n");
+          	dump_backtrace(fd, g, true);
+
+          	dump_common_tail(fd);
+          	g_report_written = 1;
+
+          	if (fd > 2)
+          	{
+          		close(fd);
+          	}
+
+          	abort();
+          }
+
+          void install_signal_handlers()
+          {
+          	struct sigaction sa;
+          	memset(&sa, 0, sizeof(sa));
+          	sigemptyset(&sa.sa_mask);
+          	sa.sa_sigaction = &crash_signal_handler;
+          	sa.sa_flags = SA_SIGINFO | SA_ONSTACK | SA_RESETHAND;
+
+          	static const int signals[] = {SIGSEGV, SIGBUS, SIGILL, SIGFPE, SIGABRT, SIGTRAP, SIGSYS};
+
+          	for (const int s : signals)
+          	{
+          		sigaction(s, &sa, nullptr);
+          	}
+          }
+
+          void trace_v(bool to_ring, const char* fmt, va_list ap)
+          {
+          	char buf[1100];
+          	const int head = snprintf(buf, sizeof(buf), "[%7ldms %-5s] ", uptime_ms(), thread_label(pthread_self()));
+          	size_t len = head > 0 ? static_cast<size_t>(head) : 0;
+
+          	if (len >= sizeof(buf) - 2)
+          	{
+          		len = sizeof(buf) - 3;
+          	}
+
+          	const int body = vsnprintf(buf + len, sizeof(buf) - len - 2, fmt, ap);
+
+          	if (body > 0)
+          	{
+          		const size_t room = sizeof(buf) - len - 2;
+          		len += (static_cast<size_t>(body) < room) ? static_cast<size_t>(body) : room - 1;
+          	}
+
+          	if (to_ring)
+          	{
+          		const unsigned slot = __sync_fetch_and_add(&g_ring_pos, 1u) % static_cast<unsigned>(kRingSize);
+          		const size_t n = len < static_cast<size_t>(kLineSize) - 1 ? len : static_cast<size_t>(kLineSize) - 1;
+          		memcpy(g_ring[slot], buf, n);
+          		g_ring[slot][n] = 0;
+          	}
+
+          	buf[len++] = '\n';
+
+          	if (g_trace_fd >= 0)
+          	{
+          		wr(g_trace_fd, buf, len);
+          	}
+          }
+
+          void* heartbeat_main(void*)
+          {
+          	pthread_setname_np("bs-heartbeat");
+          	unsigned long last_resident = 0;
+
+          	for (int tick = 0; tick < 300; ++tick) // first ~5 minutes only
+          	{
+          		sleep(1);
+
+          		unsigned long resident = 0;
+          		unsigned long free_bytes = 0;
+          		unsigned long inactive_bytes = 0;
+          		get_mem(&resident, &free_bytes, &inactive_bytes);
+
+          		const unsigned long delta = resident > last_resident ? resident - last_resident : last_resident - resident;
+
+          		if (tick % 5 == 0 || delta >= (8UL << 20))
+          		{
+          			// file only: do not push useful breadcrumbs out of the ring
+          			char line[220];
+          			const int n = snprintf(line, sizeof(line), "[%7ldms hb   ] HB resident=%lu MB free=%lu MB inactive=%lu MB\n",
+          				uptime_ms(), resident >> 20, free_bytes >> 20, inactive_bytes >> 20);
+
+          			if (g_trace_fd >= 0 && n > 0)
+          			{
+          				wr(g_trace_fd, line, static_cast<size_t>(n));
+          			}
+
+          			last_resident = resident;
+          		}
+          	}
+
+          	return nullptr;
+          }
+
+          } // namespace
+
+          // ---------------------------------------------------------------------------
+          // public C API (see bsios_bridge.h)
+          // ---------------------------------------------------------------------------
+          extern "C" void bsios_trace(const char* fmt, ...)
+          {
+          	va_list ap;
+          	va_start(ap, fmt);
+          	trace_v(true, fmt, ap);
+          	va_end(ap);
+          }
+
+          extern "C" void bsios_trace_mem(const char* tag)
+          {
+          	unsigned long resident = 0;
+          	unsigned long free_bytes = 0;
+          	unsigned long inactive_bytes = 0;
+          	get_mem(&resident, &free_bytes, &inactive_bytes);
+          	bsios_trace("MEM[%s]: resident=%lu MB free=%lu MB inactive=%lu MB",
+          		tag, resident >> 20, free_bytes >> 20, inactive_bytes >> 20);
+          }
+
+          extern "C" void bsios_run_state(int active)
+          {
+          	if (g_flag_path[0] == 0)
+          	{
+          		return;
+          	}
+
+          	if (active != 0)
+          	{
+          		const int fd = open(g_flag_path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+
+          		if (fd >= 0)
+          		{
+          			close(fd);
+          		}
+          	}
+          	else
+          	{
+          		unlink(g_flag_path);
+          	}
+          }
+
+          extern "C" void bsios_crash_note(const char* text)
+          {
+          	if (g_crash_path[0] == 0)
+          	{
+          		return;
+          	}
+
+          	const int fd = open_crash_file();
+          	ws(fd, "\n==== BStone iOS note ====\n");
+          	dump_common_head(fd);
+          	ws(fd, text);
+          	ws(fd, "\n");
+
+          	if (fd > 2)
+          	{
+          		close(fd);
+          	}
+
+          	bsios_trace("NOTE written to crash file: %.160s", text);
+          }
+
+          extern "C" void bsios_crash_thread_init(const char* name)
+          {
+          	const int i = __sync_fetch_and_add(&g_thread_count, 1);
+
+          	if (i < kMaxThreads)
+          	{
+          		g_threads[i].th = pthread_self();
+          		strncpy(g_threads[i].name, name, sizeof(g_threads[i].name) - 1);
+          		g_threads[i].name[sizeof(g_threads[i].name) - 1] = 0;
+          	}
+
+          	stack_t alt;
+          	alt.ss_sp = malloc(kAltStackSize);
+          	alt.ss_size = kAltStackSize;
+          	alt.ss_flags = 0;
+
+          	if (alt.ss_sp != nullptr)
+          	{
+          		sigaltstack(&alt, nullptr);
+          	}
+
+          	pthread_setname_np(name);
+          }
+
+          extern "C" void bsios_crash_install_dir(const char* dir, const char* device_info)
+          {
+          	gettimeofday(&g_t0, nullptr);
+
+          	snprintf(g_dir, sizeof(g_dir), "%s", dir);
+          	const size_t dir_len = strlen(g_dir);
+
+          	if (dir_len > 0 && g_dir[dir_len - 1] != '/' && dir_len + 1 < sizeof(g_dir))
+          	{
+          		g_dir[dir_len] = '/';
+          		g_dir[dir_len + 1] = 0;
+          	}
+
+          	mkdir(g_dir, 0755);
+
+          	snprintf(g_crash_path, sizeof(g_crash_path), "%sbstone_crash.txt", g_dir);
+          	snprintf(g_trace_path, sizeof(g_trace_path), "%sbstone_trace.txt", g_dir);
+          	snprintf(g_flag_path, sizeof(g_flag_path), "%sbstone_running.flag", g_dir);
+          	snprintf(g_device_info, sizeof(g_device_info), "%s", device_info != nullptr ? device_info : "?");
+
+          	const bool had_flag = access(g_flag_path, F_OK) == 0;
+
+          	struct stat st;
+
+          	if (stat(g_crash_path, &st) == 0 && st.st_size > 256 * 1024)
+          	{
+          		unlink(g_crash_path);
+          	}
+
+          	char prev_trace[1000];
+          	snprintf(prev_trace, sizeof(prev_trace), "%sbstone_trace_prev.txt", g_dir);
+          	rename(g_trace_path, prev_trace);
+          	g_trace_fd = open(g_trace_path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+
+          	bsios_trace("==== BStone iOS diagnostics ====");
+          	bsios_trace("build: %s", BS_BUILD_ID);
+          	bsios_trace("device: %s", g_device_info);
+          	bsios_trace("files: %s{bstone_log.txt,bstone_trace.txt,bstone_trace_prev.txt,bstone_crash.txt}", g_dir);
+
+          	if (had_flag)
+          	{
+          		bsios_trace("PREVIOUS RUN DIED IN THE FOREGROUND WITHOUT A CRASH REPORT: killed by the system "
+          			"(low memory / jetsam, watchdog or a hang) is likely. See bstone_trace_prev.txt (HB lines show memory).");
+          	}
+          	else
+          	{
+          		bsios_trace("previous run: no 'died in foreground' marker (clean exit, backgrounded, or a crash report exists)");
+          	}
+
+          	bsios_trace_mem("startup");
+
+          	// Alternate stack for the main thread, then the handlers.
+          	stack_t alt;
+          	alt.ss_sp = malloc(kAltStackSize);
+          	alt.ss_size = kAltStackSize;
+          	alt.ss_flags = 0;
+
+          	if (alt.ss_sp != nullptr)
+          	{
+          		sigaltstack(&alt, nullptr);
+          	}
+
+          	install_signal_handlers();
+          	std::set_terminate(&bs_terminate_handler);
+
+          	pthread_t hb;
+          	pthread_attr_t attr;
+          	pthread_attr_init(&attr);
+          	pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
+
+          	if (pthread_create(&hb, &attr, &heartbeat_main, nullptr) != 0)
+          	{
+          		bsios_trace("heartbeat thread failed to start");
+          	}
+
+          	pthread_attr_destroy(&attr);
+
+          	bsios_trace("crash handlers installed");
+          }
           BSIOS_EOF
           mkdir -p 'ios/src/sys'
           cat > 'ios/src/sys/bstone_ios_libcxx_compat.cpp' <<'BSIOS_EOF'
@@ -2110,6 +3226,14 @@ jobs:
 
           		if (symbol == nullptr)
           		{
+          			static int missing_count = 0;
+
+          			if (missing_count < 200)
+          			{
+          				++missing_count;
+          				bsios_trace("GL symbol NOT FOUND: %s", symbol_name);
+          			}
+
           			return nullptr;
           		}
 
@@ -2386,7 +3510,11 @@ jobs:
           		// Free the previous context first (only one drawable exists).
           		bsios_gl_destroy();
 
-          		if (bsios_gl_create(requested.depth_bit_count) != 0)
+          		bsios_trace("IosGlContext: creating context, depth_bit_count=%d", static_cast<int>(requested.depth_bit_count));
+          		const int bsios_create_rc = bsios_gl_create(requested.depth_bit_count);
+          		bsios_trace("IosGlContext: bsios_gl_create -> %d", bsios_create_rc);
+
+          		if (bsios_create_rc != 0)
           		{
           			BSTONE_THROW_STATIC_SOURCE("Failed to create an OpenGL ES 2.0 context.");
           		}
@@ -2783,6 +3911,61 @@ jobs:
             patch -p1 < /tmp/core.patch
           fi
 
+      - name: Patch GL extension parsing (no std::istringstream)
+        working-directory: ${{ env.BS_ROOT }}
+        run: |
+          python3 - <<'BSIOS_PY'
+          import re, sys
+          p = "src/bstone/src/bstone_gl_r3r_extension_mgr.cpp"
+          s = open(p, encoding="utf-8").read()
+          if "istringstream{gl_extensions_std_string}" not in s:
+              print("extension parsing already patched")
+              sys.exit(0)
+          old = (
+              "\tauto iss = std::istringstream{gl_extensions_std_string};\n"
+              "\textension_names_.reserve(extension_count);\n"
+              "\n"
+              "\textension_names_.assign(\n"
+              "\t\tstd::istream_iterator<std::string>{iss},\n"
+              "\t\tstd::istream_iterator<std::string>{});\n"
+          )
+          new = (
+              "\t// BSTONE_IOS: split by whitespace by hand; std::istringstream is not usable with the old libc++.dylib of iOS 7.\n"
+              "\textension_names_.clear();\n"
+              "\textension_names_.reserve(extension_count);\n"
+              "\n"
+              "\t{\n"
+              "\t\tconst auto& gl_ext = gl_extensions_std_string;\n"
+              "\t\tauto pos = std::string::size_type{};\n"
+              "\n"
+              "\t\twhile (pos < gl_ext.size())\n"
+              "\t\t{\n"
+              "\t\t\twhile (pos < gl_ext.size() && std::isspace(static_cast<unsigned char>(gl_ext[pos])) != 0)\n"
+              "\t\t\t{\n"
+              "\t\t\t\t++pos;\n"
+              "\t\t\t}\n"
+              "\n"
+              "\t\t\tconst auto begin = pos;\n"
+              "\n"
+              "\t\t\twhile (pos < gl_ext.size() && std::isspace(static_cast<unsigned char>(gl_ext[pos])) == 0)\n"
+              "\t\t\t{\n"
+              "\t\t\t\t++pos;\n"
+              "\t\t\t}\n"
+              "\n"
+              "\t\t\tif (pos > begin)\n"
+              "\t\t\t{\n"
+              "\t\t\t\textension_names_.emplace_back(gl_ext, begin, pos - begin);\n"
+              "\t\t\t}\n"
+              "\t\t}\n"
+              "\t}\n"
+          )
+          assert s.count(old) == 1, "pattern not found"
+          s = s.replace(old, new)
+          s = s.replace("#include <assert.h>\n", "#include <assert.h>\n#include <ctype.h>\n#include <cctype>\n", 1)
+          open(p, "w", encoding="utf-8").write(s)
+          print("patched extension parsing")
+          BSIOS_PY
+
       - name: Generate source list
         working-directory: ${{ env.BS_ROOT }}
         run: python3 ios/tools/gen_sources.py
@@ -2819,6 +4002,33 @@ jobs:
           (cd ipa_build && zip -rq ../packages/BStone-iOS7-armv7.ipa Payload)
           ls -la packages
 
+      - name: Save symbols (unstripped binary + symbol list)
+        if: always()
+        working-directory: ${{ env.BS_ROOT }}/ios
+        run: |
+          mkdir -p symbols
+          [ -d .theos ] || { echo "no .theos directory; nothing to save"; exit 0; }
+          export PATH="$THEOS/toolchain/linux/iphone/bin:$PATH"
+          echo "BStoneiOS7 binaries found by Theos:"
+          find .theos -type f -name BStoneiOS7 -printf '%s bytes  %p\n' | sort -nr
+          BIN="$(find .theos -type f -name BStoneiOS7 -printf '%s %p\n' | sort -nr | head -n1 | cut -d' ' -f2-)"
+          [ -n "$BIN" ] || { echo "no binary found"; exit 0; }
+          echo "Largest (assumed unstripped): $BIN"
+          cp "$BIN" symbols/BStoneiOS7.unstripped
+          OT="$(command -v llvm-otool || command -v otool || true)"
+          NM="$(command -v llvm-nm || command -v nm || true)"
+          : > symbols/uuid.txt
+          for f in $(find .theos -type f -name BStoneiOS7); do
+            echo "== $f" >> symbols/uuid.txt
+            if [ -n "$OT" ]; then "$OT" -l "$f" 2>/dev/null | grep -A2 LC_UUID >> symbols/uuid.txt || true; fi
+          done
+          if [ -n "$NM" ]; then
+            "$NM" -n -C "$BIN" > symbols/symbols.txt 2>/dev/null || "$NM" -n "$BIN" > symbols/symbols.txt 2>/dev/null || true
+          fi
+          ls -la symbols
+          cat symbols/uuid.txt
+          head -n 5 symbols/symbols.txt || true
+
       - name: Upload .ipa + .deb
         uses: actions/upload-artifact@v4
         with:
@@ -2827,4 +4037,13 @@ jobs:
             ${{ env.BS_ROOT }}/ios/packages/*.ipa
             ${{ env.BS_ROOT }}/ios/packages/*.deb
           if-no-files-found: error
+          retention-days: 30
+
+      - name: Upload symbols
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: BStone-iOS7-symbols
+          path: ${{ env.BS_ROOT }}/ios/symbols/*
+          if-no-files-found: warn
           retention-days: 30
