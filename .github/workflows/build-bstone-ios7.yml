@@ -4469,6 +4469,93 @@ jobs:
           print("patched extension parsing")
           BSIOS_PY
 
+      - name: Patch R3r command buffer alignment (ARMv7 strd/ldrd)
+        working-directory: ${{ env.BS_ROOT }}
+        run: |
+          python3 - <<'BSIOS_PY'
+          import sys
+
+          p = "src/bstone/src/bstone_r3r_cmd_buffer.cpp"
+          s = open(p, encoding="utf-8").read()
+
+          if "BSTONE_IOS: keep every id/command naturally aligned" in s:
+              print("command buffer already patched")
+              sys.exit(0)
+
+
+          def rep(old, new):
+              global s
+              assert s.count(old) == 1, ("anchor not found or not unique", old[:70])
+              s = s.replace(old, new)
+
+
+          # 1. helper
+          rep(
+              "\tstatic constexpr int get_command_id_size() noexcept\n"
+              "\t{\n"
+              "\t\treturn static_cast<int>(sizeof(R3rCmdId));\n"
+              "\t}\n",
+              "\tstatic constexpr int get_command_id_size() noexcept\n"
+              "\t{\n"
+              "\t\treturn static_cast<int>(sizeof(R3rCmdId));\n"
+              "\t}\n"
+              "\n"
+              "\tstatic constexpr int align_up(int value, int alignment) noexcept\n"
+              "\t{\n"
+              "\t\treturn (value + alignment - 1) / alignment * alignment;\n"
+              "\t}\n",
+          )
+
+          # 2. writer
+          rep(
+              "\t\tconstexpr auto command_size = static_cast<int>(sizeof(TCommand));\n"
+              "\t\tconstexpr auto block_size = get_command_id_size() + command_size;\n"
+              "\n"
+              "\t\tresize_if_necessary(block_size);\n"
+              "\n"
+              "\t\tauto block = &data_[write_offset_];\n"
+              "\t\t*reinterpret_cast<R3rCmdId*>(block) = command_id;\n"
+              "\n"
+              "\t\twrite_offset_ += block_size;\n"
+              "\t\t++command_count_;\n"
+              "\n"
+              "\t\treturn *reinterpret_cast<TCommand*>(block + get_command_id_size());\n",
+              "\t\tconstexpr auto command_size = static_cast<int>(sizeof(TCommand));\n"
+              "\t\tconstexpr auto id_align = static_cast<int>(alignof(R3rCmdId));\n"
+              "\t\tconstexpr auto command_align = static_cast<int>(alignof(TCommand));\n"
+              "\t\tconstexpr auto block_size = get_command_id_size() + command_size + (id_align - 1) + (command_align - 1);\n"
+              "\n"
+              "\t\tresize_if_necessary(block_size);\n"
+              "\n"
+              "\t\t// BSTONE_IOS: keep every id/command naturally aligned. The stream used to be packed, so a command of\n"
+              "\t\t// size 1 or 2 left the next block misaligned; ARMv7 strd/ldrd/vldr/vstr then raise an alignment fault.\n"
+              "\t\tconst auto id_offset = align_up(write_offset_, id_align);\n"
+              "\t\tconst auto command_offset = align_up(id_offset + get_command_id_size(), command_align);\n"
+              "\n"
+              "\t\t*reinterpret_cast<R3rCmdId*>(&data_[id_offset]) = command_id;\n"
+              "\n"
+              "\t\twrite_offset_ = command_offset + command_size;\n"
+              "\t\t++command_count_;\n"
+              "\n"
+              "\t\treturn *reinterpret_cast<TCommand*>(&data_[command_offset]);\n",
+          )
+
+          # 3. reader (mirrors the writer: id and command are each aligned to their own type)
+          rep(
+              "\t\tconst auto command_size = static_cast<int>(sizeof(TCommand));\n"
+              "\n"
+              "\t\tif ((size_ - read_offset_) < command_size)\n",
+              "\t\tread_offset_ = align_up(read_offset_, static_cast<int>(alignof(TCommand))); // BSTONE_IOS (see write())\n"
+              "\n"
+              "\t\tconst auto command_size = static_cast<int>(sizeof(TCommand));\n"
+              "\n"
+              "\t\tif ((size_ - read_offset_) < command_size)\n",
+          )
+
+          open(p, "w", encoding="utf-8").write(s)
+          print("patched command buffer alignment")
+          BSIOS_PY
+
       - name: Generate source list
         working-directory: ${{ env.BS_ROOT }}
         run: python3 ios/tools/gen_sources.py
