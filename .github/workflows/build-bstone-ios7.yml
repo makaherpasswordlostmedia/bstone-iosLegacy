@@ -615,10 +615,11 @@ jobs:
           		glBindRenderbuffer(GL_RENDERBUFFER, g_depth_rb);
           		// 24-bit depth (GL_OES_depth24) exists on every iOS 7 capable GPU, but 16 bits is what
           		// the renderer asks for and is cheaper on the tile-based SGX parts.
-          		glRenderbufferStorage(GL_RENDERBUFFER, depth_bits > 16 ? GL_DEPTH_COMPONENT24_OES : GL_DEPTH_COMPONENT16,
+          		const bool want24 = depth_bits > 16 && BSHost_GetConfig().depth_24;
+          		glRenderbufferStorage(GL_RENDERBUFFER, want24 ? GL_DEPTH_COMPONENT24_OES : GL_DEPTH_COMPONENT16,
           		                      g_w, g_h);
           		glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_DEPTH_ATTACHMENT, GL_RENDERBUFFER, g_depth_rb);
-          		bsios_trace("depth renderbuffer %u (%d bit)", (unsigned)g_depth_rb, depth_bits > 16 ? 24 : 16);
+          		bsios_trace("depth renderbuffer %u (%d bit)", (unsigned)g_depth_rb, want24 ? 24 : 16);
           		TraceGLError("depth attachment");
           	}
 
@@ -688,9 +689,10 @@ jobs:
 
           		CAEAGLLayer* layer = (CAEAGLLayer*)self.layer;
           		layer.opaque = YES;
+          		BSConfig fmt_cfg = BSHost_GetConfig();
           		layer.drawableProperties = @{
           			kEAGLDrawablePropertyRetainedBacking : @NO,
-          			kEAGLDrawablePropertyColorFormat : kEAGLColorFormatRGBA8,
+          			kEAGLDrawablePropertyColorFormat : (fmt_cfg.color_565 ? kEAGLColorFormatRGB565 : kEAGLColorFormatRGBA8),
           		};
 
           		// Drawable pixels per point. The game renders its 3D view at drawable resolution, so a
@@ -782,6 +784,8 @@ jobs:
           	float render_scale;       // drawable pixels per point; 0 = "use the screen scale"
           	int touch_controls;       // 1 = draw the on-screen controls
           	int show_fps_hint;        // reserved
+          	int color_565;            // 1 = 16-bit RGB565 drawable (less bandwidth on SGX), 0 = RGBA8
+          	int depth_24;             // 1 = allow a 24-bit depth buffer, 0 = always 16-bit
           } BSConfig;
 
           BSConfig BSHost_GetConfig(void);
@@ -829,6 +833,7 @@ jobs:
           #include <stdlib.h>
           #include <string.h>
           #include <sys/stat.h>
+          #include <sys/sysctl.h>
           #include <dispatch/dispatch.h>
 
           #include "bsios_bridge.h"
@@ -836,7 +841,7 @@ jobs:
           // ---------------------------------------------------------------------------
           // State
           // ---------------------------------------------------------------------------
-          static BSConfig g_config = {1.0f, 1, 0};
+          static BSConfig g_config = {1.0f, 1, 0, 1, 0};
 
           static BSGLView* g_gl_view;                    // strong; set once on the main thread before the game starts
           static std::atomic<int> g_view_px_w(0);
@@ -883,6 +888,15 @@ jobs:
           void BSHost_LoadConfig(void) {
           	g_config.render_scale = 1.0f;
           	g_config.touch_controls = 1;
+          	g_config.color_565 = 1;
+          	g_config.depth_24 = 0;
+          	{
+          		// iPad 1 (A4 / SGX535, 1024x768, no retina) cannot sustain full-resolution 3D: default to 0.75.
+          		char machine[64] = {0};
+          		size_t msz = sizeof(machine) - 1;
+          		if (sysctlbyname("hw.machine", machine, &msz, NULL, 0) == 0 && strncmp(machine, "iPad1,", 6) == 0)
+          			g_config.render_scale = 0.75f;
+          	}
           	NSString* ini = LoadIniText();
           	if (!ini) return;
           	NSString* v;
@@ -891,6 +905,8 @@ jobs:
           		if (f >= 0.0f && f <= 4.0f) g_config.render_scale = f;
           	}
           	if ((v = ReadIniValue(ini, @"touch_controls"))) g_config.touch_controls = [v intValue] != 0;
+          	if ((v = ReadIniValue(ini, @"color_565"))) g_config.color_565 = [v intValue] != 0;
+          	if ((v = ReadIniValue(ini, @"depth_24"))) g_config.depth_24 = [v intValue] != 0;
           }
 
           // ---------------------------------------------------------------------------
@@ -1110,10 +1126,17 @@ jobs:
           //   top         : MENU (Esc), ENTER, TAB (stats), Y, N, and the weapon keys 1..6
           //   anywhere else: dragging turns the player (relative mouse motion, X axis)
           //
-          // Every control is hit-tested by this single view, which owns all touches (multipleTouchEnabled), so
-          // any combination of fingers works without per-button UIControl plumbing.
+          // Performance notes (iPad 1 / A4 / SGX535):
+          //   The previous version redrew the whole screen with Core Graphics (drawRect) on the main thread on every
+          //   button press and stick change, then re-blended a full-screen translucent layer over the GL layer.
+          //   Now every control is its own small CALayer with a pre-rendered bitmap (normal / pressed) that is created
+          //   once per layout. Pressing a button only swaps `contents`, moving the stick only moves the knob layer:
+          //   no CPU drawing, no text measuring, no full-screen backing store. Touch bookkeeping uses a fixed slot
+          //   array instead of NSDictionary/NSValue allocations per touch event.
           #import "BSTouchOverlay.h"
           #import "BSHost.h"
+
+          #import <QuartzCore/QuartzCore.h>
 
           #include <vector>
           #include "bsios_bridge.h"
@@ -1151,17 +1174,27 @@ jobs:
 
           enum StickDir { kDirUp = 1, kDirDown = 2, kDirLeft = 4, kDirRight = 8 };
 
+          constexpr int kMaxTouches = 12;
+
+          struct TouchSlot {
+          	const void* touch;              // UITouch pointer used as identity (nullptr = free slot)
+          	int control;                    // control index, or -1 for the look area
+          	CGPoint last;                   // last position (look area)
+          };
+
           }  // namespace
 
           @implementation BSTouchOverlay {
           	std::vector<Control> _controls;
-          	NSMutableDictionary* _touchToControl;   // touch pointer -> NSNumber(control index)
-          	NSMutableDictionary* _lookLast;         // touch pointer -> NSValue(CGPoint last)
+          	NSMutableArray* _layers;                // CALayer per control (same indices as _controls)
+          	NSMutableArray* _imgOff;                // UIImage per control, released state
+          	NSMutableArray* _imgOn;                 // UIImage per control, pressed / latched state
+          	CALayer* _knob;
+          	TouchSlot _slots[kMaxTouches];
           	int _stickIndex;
           	int _stickDirs;                         // directions currently held by the stick
-          	CGPoint _stickTouch;
           	CGFloat _unit;
-          	BOOL _grabRequested;
+          	CGSize _builtForSize;
           }
 
           - (instancetype)initWithFrame:(CGRect)frame {
@@ -1170,9 +1203,13 @@ jobs:
           		self.opaque = NO;
           		self.multipleTouchEnabled = YES;
           		self.exclusiveTouch = NO;
-          		_touchToControl = [NSMutableDictionary dictionary];
-          		_lookLast = [NSMutableDictionary dictionary];
+          		self.clearsContextBeforeDrawing = NO;
+          		_layers = [NSMutableArray array];
+          		_imgOff = [NSMutableArray array];
+          		_imgOn = [NSMutableArray array];
+          		for (int i = 0; i < kMaxTouches; i++) _slots[i] = TouchSlot{nullptr, -1, CGPointZero};
           		_stickIndex = -1;
+          		_builtForSize = CGSizeZero;
           		[self buildControls];
           	}
           	return self;
@@ -1180,9 +1217,58 @@ jobs:
 
           - (void)layoutSubviews {
           	[super layoutSubviews];
+          	// Only rebuild when the size really changed (rotation); layoutSubviews can fire for other reasons.
+          	if (CGSizeEqualToSize(_builtForSize, self.bounds.size)) return;
           	[self releaseAll];
           	[self buildControls];
-          	[self setNeedsDisplay];
+          }
+
+          // ---------------------------------------------------------------------------
+          // Pre-rendered bitmaps
+          // ---------------------------------------------------------------------------
+          static UIImage* RenderCircle(CGFloat radius, NSString* label, CGFloat fontSize, BOOL on, BOOL stick) {
+          	CGFloat scale = [UIScreen mainScreen].scale;
+          	CGSize size = CGSizeMake(ceil(2 * radius), ceil(2 * radius));
+          	UIGraphicsBeginImageContextWithOptions(size, NO, scale);
+          	CGContextRef g = UIGraphicsGetCurrentContext();
+          	CGRect r = CGRectMake(0, 0, size.width, size.height);
+          	if (stick) {
+          		CGContextSetFillColorWithColor(g, [UIColor colorWithWhite:1 alpha:0.10].CGColor);
+          		CGContextFillEllipseInRect(g, r);
+          		CGContextSetStrokeColorWithColor(g, [UIColor colorWithWhite:1 alpha:0.35].CGColor);
+          		CGContextSetLineWidth(g, 2);
+          		CGContextStrokeEllipseInRect(g, CGRectInset(r, 1, 1));
+          	} else {
+          		CGContextSetFillColorWithColor(g, [UIColor colorWithWhite:(on ? 1.0 : 0.0) alpha:(on ? 0.45 : 0.28)].CGColor);
+          		CGContextFillEllipseInRect(g, r);
+          		CGContextSetStrokeColorWithColor(g, [UIColor colorWithWhite:1 alpha:0.45].CGColor);
+          		CGContextSetLineWidth(g, 1.5);
+          		CGContextStrokeEllipseInRect(g, CGRectInset(r, 1, 1));
+          		if (label.length) {
+          			NSDictionary* attrs = @{
+          				NSFontAttributeName : [UIFont boldSystemFontOfSize:fontSize],
+          				NSForegroundColorAttributeName : [UIColor colorWithWhite:1.0 alpha:0.85],
+          			};
+          			CGSize ts = [label sizeWithAttributes:attrs];
+          			[label drawAtPoint:CGPointMake((size.width - ts.width) / 2, (size.height - ts.height) / 2)
+          			    withAttributes:attrs];
+          		}
+          	}
+          	UIImage* img = UIGraphicsGetImageFromCurrentImageContext();
+          	UIGraphicsEndImageContext();
+          	return img;
+          }
+
+          static UIImage* RenderKnob(CGFloat radius) {
+          	CGFloat scale = [UIScreen mainScreen].scale;
+          	CGSize size = CGSizeMake(ceil(2 * radius), ceil(2 * radius));
+          	UIGraphicsBeginImageContextWithOptions(size, NO, scale);
+          	CGContextRef g = UIGraphicsGetCurrentContext();
+          	CGContextSetFillColorWithColor(g, [UIColor whiteColor].CGColor);
+          	CGContextFillEllipseInRect(g, CGRectMake(0, 0, size.width, size.height));
+          	UIImage* img = UIGraphicsGetImageFromCurrentImageContext();
+          	UIGraphicsEndImageContext();
+          	return img;
           }
 
           // ---------------------------------------------------------------------------
@@ -1192,8 +1278,10 @@ jobs:
           }
 
           - (void)buildControls {
+          	[self releaseAll];
           	_controls.clear();
           	CGSize sz = self.bounds.size;
+          	_builtForSize = sz;
           	CGFloat W = sz.width, H = sz.height;
           	_unit = MAX(1.0, MIN(H / 320.0, 2.0));
           	CGFloat u = _unit, m = 14 * u;
@@ -1232,6 +1320,76 @@ jobs:
           		[self addButton:[NSString stringWithFormat:@"%d", i + 1] x:wx y:m + wr r:wr keys:std::vector<int>{nums[i]} latch:NO];
           		wx -= 2 * wr + 4 * u;
           	}
+
+          	// Build the layers (one-time CPU rendering per layout).
+          	[CATransaction begin];
+          	[CATransaction setDisableActions:YES];
+          	for (CALayer* l in [self.layer.sublayers copy]) [l removeFromSuperlayer];
+          	[_layers removeAllObjects];
+          	[_imgOff removeAllObjects];
+          	[_imgOn removeAllObjects];
+
+          	CGFloat screenScale = [UIScreen mainScreen].scale;
+          	CGFloat fontSize = MAX(9.0, 11.0 * u);
+          	for (size_t i = 0; i < _controls.size(); i++) {
+          		const Control& c = _controls[i];
+          		BOOL isStick = c.kind == kStick;
+          		UIImage* off = RenderCircle(c.radius, c.label, fontSize, NO, isStick);
+          		UIImage* on = isStick ? off : RenderCircle(c.radius, c.label, fontSize, YES, NO);
+          		CALayer* layer = [CALayer layer];
+          		layer.frame = CGRectMake(c.center.x - c.radius, c.center.y - c.radius, 2 * c.radius, 2 * c.radius);
+          		layer.contentsScale = screenScale;
+          		layer.contents = (__bridge id)off.CGImage;
+          		layer.opaque = NO;
+          		layer.actions = @{@"contents" : [NSNull null], @"position" : [NSNull null], @"opacity" : [NSNull null],
+          		                  @"bounds" : [NSNull null], @"hidden" : [NSNull null]};
+          		[self.layer addSublayer:layer];
+          		[_layers addObject:layer];
+          		[_imgOff addObject:off];
+          		[_imgOn addObject:on];
+          	}
+
+          	// Stick knob.
+          	const Control& s = _controls[_stickIndex];
+          	CGFloat kr = s.radius * 0.30;
+          	_knob = [CALayer layer];
+          	_knob.bounds = CGRectMake(0, 0, 2 * kr, 2 * kr);
+          	_knob.position = s.center;
+          	_knob.contentsScale = screenScale;
+          	_knob.contents = (__bridge id)RenderKnob(kr).CGImage;
+          	_knob.opacity = 0.25f;
+          	_knob.opaque = NO;
+          	_knob.actions = @{@"contents" : [NSNull null], @"position" : [NSNull null], @"opacity" : [NSNull null]};
+          	[self.layer addSublayer:_knob];
+          	[CATransaction commit];
+          }
+
+          // Pure layer updates: no redraw, no allocation, no implicit animation.
+          - (void)refreshControl:(int)i {
+          	const Control& c = _controls[i];
+          	BOOL on = c.pressCount > 0 || c.latched;
+          	CALayer* layer = _layers[i];
+          	UIImage* img = on ? _imgOn[i] : _imgOff[i];
+          	[CATransaction begin];
+          	[CATransaction setDisableActions:YES];
+          	layer.contents = (__bridge id)img.CGImage;
+          	[CATransaction commit];
+          }
+
+          - (void)refreshKnob {
+          	const Control& s = _controls[_stickIndex];
+          	CGFloat dx = 0, dy = 0;
+          	if (_stickDirs & kDirLeft) dx -= 1;
+          	if (_stickDirs & kDirRight) dx += 1;
+          	if (_stickDirs & kDirUp) dy -= 1;
+          	if (_stickDirs & kDirDown) dy += 1;
+          	CGFloat n = sqrt(dx * dx + dy * dy);
+          	if (n > 0) { dx /= n; dy /= n; }
+          	[CATransaction begin];
+          	[CATransaction setDisableActions:YES];
+          	_knob.position = CGPointMake(s.center.x + dx * s.radius * 0.55, s.center.y + dy * s.radius * 0.55);
+          	_knob.opacity = n > 0 ? 0.55f : 0.25f;
+          	[CATransaction commit];
           }
 
           // ---------------------------------------------------------------------------
@@ -1281,14 +1439,31 @@ jobs:
           		else              { KeyUp(m.k1);   if (m.k2) KeyUp(m.k2); }
           	}
           	_stickDirs = dirs;
-          	[self setNeedsDisplay];
+          	if (_stickIndex >= 0 && !_controls.empty()) [self refreshKnob];
+          }
+
+          // ---------------------------------------------------------------------------
+          // Touch slots
+          // ---------------------------------------------------------------------------
+          - (int)slotFor:(UITouch*)t {
+          	const void* key = (__bridge const void*)t;
+          	for (int i = 0; i < kMaxTouches; i++) if (_slots[i].touch == key) return i;
+          	return -1;
+          }
+
+          - (int)allocSlotFor:(UITouch*)t {
+          	for (int i = 0; i < kMaxTouches; i++) {
+          		if (!_slots[i].touch) {
+          			_slots[i].touch = (__bridge const void*)t;
+          			return i;
+          		}
+          	}
+          	return -1;
           }
 
           // ---------------------------------------------------------------------------
           // Touches
           // ---------------------------------------------------------------------------
-          - (NSValue*)keyFor:(UITouch*)t { return [NSValue valueWithPointer:(__bridge const void*)t]; }
-
           - (void)pressControl:(int)i {
           	Control& c = _controls[i];
           	if (c.latch) {
@@ -1297,34 +1472,33 @@ jobs:
           	} else {
           		if (c.pressCount++ == 0) for (int k : c.keys) KeyDown(k);
           	}
-          	[self setNeedsDisplay];
+          	[self refreshControl:i];
           }
 
           - (void)releaseControl:(int)i {
           	Control& c = _controls[i];
           	if (c.latch) return;
           	if (c.pressCount > 0 && --c.pressCount == 0) for (int k : c.keys) KeyUp(k);
-          	[self setNeedsDisplay];
+          	[self refreshControl:i];
           }
 
           - (void)touchesBegan:(NSSet*)touches withEvent:(UIEvent*)event {
           	for (UITouch* t in touches) {
+          		int slot = [self allocSlotFor:t];
+          		if (slot < 0) continue;
           		CGPoint p = [t locationInView:self];
           		int idx = [self controlIndexAt:p];
-          		NSValue* key = [self keyFor:t];
+          		_slots[slot].control = idx;
+          		_slots[slot].last = p;
           		if (idx < 0) {
-          			_touchToControl[key] = @(-1);
-          			_lookLast[key] = [NSValue valueWithCGPoint:p];
           			if (!bsios_mouse_is_relative()) {
           				// BStone only reads mouse deltas while the mouse is "grabbed", and the first click grabs it.
           				bsios_event_push_mouse_button(0, 1, (int)p.x, (int)p.y);
           				bsios_event_push_mouse_button(0, 0, (int)p.x, (int)p.y);
           			}
           		} else if (_controls[idx].kind == kStick) {
-          			_touchToControl[key] = @(idx);
           			[self applyStickDirs:[self stickDirsForPoint:p]];
           		} else {
-          			_touchToControl[key] = @(idx);
           			[self pressControl:idx];
           		}
           	}
@@ -1332,18 +1506,16 @@ jobs:
 
           - (void)touchesMoved:(NSSet*)touches withEvent:(UIEvent*)event {
           	for (UITouch* t in touches) {
-          		NSValue* key = [self keyFor:t];
-          		NSNumber* n = _touchToControl[key];
-          		if (!n) continue;
+          		int slot = [self slotFor:t];
+          		if (slot < 0) continue;
+          		int idx = _slots[slot].control;
           		CGPoint p = [t locationInView:self];
-          		int idx = n.intValue;
           		if (idx == -1) {
-          			CGPoint last = [_lookLast[key] CGPointValue];
           			// Horizontal drag turns the player; a swipe across the screen is roughly a half turn.
-          			int dx = (int)lround((p.x - last.x) * 2.0);
+          			int dx = (int)lround((p.x - _slots[slot].last.x) * 2.0);
           			if (dx != 0) {
           				bsios_event_push_mouse_motion((int)p.x, (int)p.y, dx, 0, 0);
-          				_lookLast[key] = [NSValue valueWithCGPoint:p];
+          				_slots[slot].last = p;
           			}
           		} else if (_controls[idx].kind == kStick) {
           			[self applyStickDirs:[self stickDirsForPoint:p]];
@@ -1353,16 +1525,14 @@ jobs:
 
           - (void)finishTouches:(NSSet*)touches {
           	for (UITouch* t in touches) {
-          		NSValue* key = [self keyFor:t];
-          		NSNumber* n = _touchToControl[key];
-          		if (!n) continue;
-          		int idx = n.intValue;
+          		int slot = [self slotFor:t];
+          		if (slot < 0) continue;
+          		int idx = _slots[slot].control;
           		if (idx >= 0) {
           			if (_controls[idx].kind == kStick) [self applyStickDirs:0];
           			else [self releaseControl:idx];
           		}
-          		[_touchToControl removeObjectForKey:key];
-          		[_lookLast removeObjectForKey:key];
+          		_slots[slot] = TouchSlot{nullptr, -1, CGPointZero};
           	}
           }
 
@@ -1371,59 +1541,20 @@ jobs:
 
           - (void)releaseAll {
           	[self applyStickDirs:0];
-          	for (Control& c : _controls) {
-          		if (c.latch && c.latched) { for (int k : c.keys) KeyUp(k); c.latched = NO; }
-          		while (c.pressCount > 0) { c.pressCount--; if (c.pressCount == 0) for (int k : c.keys) KeyUp(k); }
+          	for (size_t i = 0; i < _controls.size(); i++) {
+          		Control& c = _controls[i];
+          		BOOL dirty = NO;
+          		if (c.latch && c.latched) { for (int k : c.keys) KeyUp(k); c.latched = NO; dirty = YES; }
+          		while (c.pressCount > 0) { c.pressCount--; if (c.pressCount == 0) for (int k : c.keys) KeyUp(k); dirty = YES; }
+          		if (dirty && i < _layers.count) [self refreshControl:(int)i];
           	}
-          	[_touchToControl removeAllObjects];
-          	[_lookLast removeAllObjects];
+          	for (int i = 0; i < kMaxTouches; i++) _slots[i] = TouchSlot{nullptr, -1, CGPointZero};
           	for (int k = 0; k < 256; k++) {
           		if (g_key_down_count[k] > 0) { g_key_down_count[k] = 0; bsios_event_push_key(k, 0); }
           	}
-          	[self setNeedsDisplay];
           }
 
-          // ---------------------------------------------------------------------------
-          // Drawing
-          // ---------------------------------------------------------------------------
-          - (void)drawRect:(CGRect)rect {
-          	CGContextRef g = UIGraphicsGetCurrentContext();
-          	NSDictionary* attrs = @{
-          		NSFontAttributeName : [UIFont boldSystemFontOfSize:MAX(9.0, 11.0 * _unit)],
-          		NSForegroundColorAttributeName : [UIColor colorWithWhite:1.0 alpha:0.85],
-          	};
-          	for (const Control& c : _controls) {
-          		CGRect r = CGRectMake(c.center.x - c.radius, c.center.y - c.radius, 2 * c.radius, 2 * c.radius);
-          		BOOL on = c.pressCount > 0 || c.latched;
-          		if (c.kind == kStick) {
-          			CGContextSetFillColorWithColor(g, [UIColor colorWithWhite:1 alpha:0.10].CGColor);
-          			CGContextFillEllipseInRect(g, r);
-          			CGContextSetStrokeColorWithColor(g, [UIColor colorWithWhite:1 alpha:0.35].CGColor);
-          			CGContextSetLineWidth(g, 2);
-          			CGContextStrokeEllipseInRect(g, CGRectInset(r, 1, 1));
-          			// Highlight active directions with a dot.
-          			CGFloat dx = 0, dy = 0;
-          			if (_stickDirs & kDirLeft) dx -= 1;
-          			if (_stickDirs & kDirRight) dx += 1;
-          			if (_stickDirs & kDirUp) dy -= 1;
-          			if (_stickDirs & kDirDown) dy += 1;
-          			CGFloat n = sqrt(dx * dx + dy * dy);
-          			if (n > 0) { dx /= n; dy /= n; }
-          			CGFloat kr = c.radius * 0.30;
-          			CGPoint kc = CGPointMake(c.center.x + dx * c.radius * 0.55, c.center.y + dy * c.radius * 0.55);
-          			CGContextSetFillColorWithColor(g, [UIColor colorWithWhite:1 alpha:(n > 0 ? 0.55 : 0.25)].CGColor);
-          			CGContextFillEllipseInRect(g, CGRectMake(kc.x - kr, kc.y - kr, 2 * kr, 2 * kr));
-          			continue;
-          		}
-          		CGContextSetFillColorWithColor(g, [UIColor colorWithWhite:(on ? 1.0 : 0.0) alpha:(on ? 0.45 : 0.28)].CGColor);
-          		CGContextFillEllipseInRect(g, r);
-          		CGContextSetStrokeColorWithColor(g, [UIColor colorWithWhite:1 alpha:0.45].CGColor);
-          		CGContextSetLineWidth(g, 1.5);
-          		CGContextStrokeEllipseInRect(g, CGRectInset(r, 1, 1));
-          		CGSize ts = [c.label sizeWithAttributes:attrs];
-          		[c.label drawAtPoint:CGPointMake(c.center.x - ts.width / 2, c.center.y - ts.height / 2) withAttributes:attrs];
-          	}
-          }
+          // No drawRect: all visuals are CALayers.
 
           @end
           BSIOS_EOF
