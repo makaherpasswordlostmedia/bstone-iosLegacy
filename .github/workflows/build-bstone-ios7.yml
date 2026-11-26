@@ -435,6 +435,61 @@ jobs:
           #import <QuartzCore/QuartzCore.h>
 
           #include "bsios_bridge.h"
+          #include <dlfcn.h>
+
+          // ---------------------------------------------------------------------------------------------------------
+          // The BStone core defines GLOBAL function-pointer variables named exactly like the OpenGL entry points
+          // (bstone_gl_r3r_api.cpp: `PFNGLGETSTRINGPROC glGetString = 0;` and so on). A direct call to glGetString()
+          // from this file is bound by the static linker to that variable (the executable wins over the framework):
+          // the CPU jumps into a non-executable data page (SIGBUS "at glGetString+0"). So every OpenGL call in this
+          // file goes through pointers loaded from the OpenGLES framework by handle (dlsym on a handle never looks
+          // into the executable).
+          // ---------------------------------------------------------------------------------------------------------
+          #define BSGL_FUNCS(X) \
+          	X(glGetString) 	X(glGetError) 	X(glGetIntegerv) 	X(glFinish) 	X(glCheckFramebufferStatus) 	X(glBindRenderbuffer) 	X(glGetRenderbufferParameteriv) 	X(glGenRenderbuffers) 	X(glFramebufferRenderbuffer) 	X(glDeleteRenderbuffers) 	X(glBindFramebuffer) 	X(glViewport) 	X(glRenderbufferStorage) 	X(glGenFramebuffers) 	X(glDeleteFramebuffers)
+
+          #define BSGL_DECLARE(name) static decltype(&name) bsgl_##name = nullptr;
+          BSGL_FUNCS(BSGL_DECLARE)
+          #undef BSGL_DECLARE
+
+          static bool BSGL_LoadFunctions(void) {
+          	static bool loaded = false;
+          	if (loaded) return true;
+          	void* lib = dlopen("/System/Library/Frameworks/OpenGLES.framework/OpenGLES", RTLD_NOW);
+          	bsios_trace("OpenGLES framework handle=%p", lib);
+          	if (!lib) {
+          		bsios_trace("dlopen(OpenGLES) failed: %s", dlerror());
+          		return false;
+          	}
+          	bool ok = true;
+          #define BSGL_LOAD(name) \
+          	bsgl_##name = reinterpret_cast<decltype(&name)>(dlsym(lib, #name)); \
+          	if (!bsgl_##name) { \
+          		bsios_trace("OpenGLES symbol NOT FOUND: %s", #name); \
+          		ok = false; \
+          	}
+          	BSGL_FUNCS(BSGL_LOAD)
+          #undef BSGL_LOAD
+          	loaded = ok;
+          	return ok;
+          }
+
+          // From here on, the plain GL names mean the framework's functions.
+          #define glGetString bsgl_glGetString
+          #define glGetError bsgl_glGetError
+          #define glGetIntegerv bsgl_glGetIntegerv
+          #define glFinish bsgl_glFinish
+          #define glCheckFramebufferStatus bsgl_glCheckFramebufferStatus
+          #define glBindRenderbuffer bsgl_glBindRenderbuffer
+          #define glGetRenderbufferParameteriv bsgl_glGetRenderbufferParameteriv
+          #define glGenRenderbuffers bsgl_glGenRenderbuffers
+          #define glFramebufferRenderbuffer bsgl_glFramebufferRenderbuffer
+          #define glDeleteRenderbuffers bsgl_glDeleteRenderbuffers
+          #define glBindFramebuffer bsgl_glBindFramebuffer
+          #define glViewport bsgl_glViewport
+          #define glRenderbufferStorage bsgl_glRenderbufferStorage
+          #define glGenFramebuffers bsgl_glGenFramebuffers
+          #define glDeleteFramebuffers bsgl_glDeleteFramebuffers
 
           static EAGLContext* g_ctx;
           static GLuint g_fbo, g_color_rb, g_depth_rb;
@@ -475,6 +530,10 @@ jobs:
 
           extern "C" int bsios_gl_create(int depth_bits) {
           	bsios_trace("bsios_gl_create(depth_bits=%d)", depth_bits);
+          	if (!BSGL_LoadFunctions()) {
+          		bsios_trace("cannot load the OpenGLES entry points -> -5");
+          		return -5;
+          	}
           	bsios_trace_mem("before gl create");
           	DestroyGLObjects();
 
@@ -590,7 +649,7 @@ jobs:
           	// iOS terminates apps that issue GL commands while in background: wait here while inactive.
           	// glFinish() runs right before parking, so all queued GL work is complete when the main thread
           	// (BSHost_WaitUntilParked) lets the app go to background.
-          	BSHost_ParkIfInactive(&glFinish);
+          	BSHost_ParkIfInactive(glFinish);
           	glBindRenderbuffer(GL_RENDERBUFFER, g_color_rb);
           	[g_ctx presentRenderbuffer:GL_RENDERBUFFER];
           	static int swap_traces = 0;
@@ -3663,8 +3722,10 @@ jobs:
           			return nullptr;
           		}
 
-          		// RTLD_DEFAULT: the OpenGLES framework is linked into the executable.
-          		void* const symbol = dlsym(RTLD_DEFAULT, symbol_name);
+          		// Search the OpenGLES framework by handle. RTLD_DEFAULT would look into the executable first, and the
+          		// core defines global function-pointer variables with exactly these names (glGetString, ...).
+          		static void* const gl_lib = dlopen("/System/Library/Frameworks/OpenGLES.framework/OpenGLES", RTLD_NOW);
+          		void* const symbol = dlsym(gl_lib != nullptr ? gl_lib : RTLD_DEFAULT, symbol_name);
 
           		if (symbol == nullptr)
           		{
